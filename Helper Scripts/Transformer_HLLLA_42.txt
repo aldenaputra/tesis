@@ -1,0 +1,875 @@
+Notebook: Transformer_HLLLA_42.ipynb
+Kernelspec: {'display_name': 'tesis_env', 'language': 'python', 'name': 'python3'}
+
+--------------------------------------------------------------------------------
+Cell 1
+Cell type: code
+-- Code --
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
+import matplotlib.patches as mpatches
+import time, json, random, math, os, sys
+
+from datetime import datetime
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, mean_absolute_percentage_error
+
+import tensorflow as tf
+from tensorflow.keras import Model, Input, regularizers
+from tensorflow.keras.layers import (
+    Dense, Dropout, LayerNormalization, MultiHeadAttention, Add, Lambda
+)
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras.optimizers import Adam, RMSprop
+--------------------------------------------------------------------------------
+Cell 2
+Cell type: code
+-- Code --
+# ---------------- User knobs ----------------
+CSV_PATH   = "ALL_MERGED.csv"   # <--- set your CSV path
+DATE_COL   = "Date"
+TARGET_COL = "JKSE"
+INCLUDE_TARGET_AS_FEATURE = True  # False to exclude TARGET from X
+TEST_SIZE   = 0.20
+VAL_SIZE    = 0.10
+RANDOM_SEED = 42
+MAX_EPOCHS  = 100
+VERBOSE_TRAIN = 1
+
+# Random search settings
+Z_LEVEL = 1.96
+ALPHA = 0.05
+ROLL_WIN = 30       # if later you want rolling PICP/MPIW
+HEAT_WIN = 30
+HEAT_STRIDE = 10
+
+N_TRIALS   = 3                # bump to 40–60 for deeper search
+PATIENCE   = 10
+WEIGHTS_BEST = "Model Weights/rs_transformer_best.weights.h5"
+MODEL_BEST   = "Model Checkpoints/transformer_rs_checkpoint.keras"
+
+print(RANDOM_SEED)
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
+os.environ["PYTHONHASHSEED"] = str(RANDOM_SEED)
+-- Outputs --
+[1] output_type: stream
+42
+--------------------------------------------------------------------------------
+Cell 3
+Cell type: code
+-- Code --
+df = pd.read_csv(CSV_PATH)
+
+required = [
+    "Date","Nickel_Fut","Coal_Fut_Newcastle","Palm_Oil_Fut",
+    "USD_IDR","CNY_IDR","EUR_IDR","BTC_USD",
+    "FTSE100","HANGSENG","NIKKEI225","SNP500","DOW30","SSE_Composite","JKSE"
+]
+missing = [c for c in required if c not in df.columns]
+if missing:
+    raise ValueError(f"Missing columns: {missing}")
+
+df[DATE_COL] = pd.to_datetime(df[DATE_COL])
+df = df.sort_values(DATE_COL).set_index(DATE_COL)
+df = df.ffill().bfill()
+df
+-- Outputs --
+[1] output_type: execute_result
+            Nickel_Fut  Coal_Fut_Newcastle  Palm_Oil_Fut  USD_IDR  CNY_IDR  \
+Date                                                                         
+2015-05-01    13750.00               62.20          2136  12962.5  2089.78   
+2015-05-02    13750.00               62.20          2136  12962.5  2089.78   
+2015-05-03    13750.00               62.20          2136  12962.5  2089.78   
+2015-05-04    13750.00               62.20          2136  12980.0  2090.51   
+2015-05-05    14245.00               62.50          2136  13047.5  2102.39   
+...                ...                 ...           ...      ...      ...   
+2025-04-27    15482.88               93.75          4057  16830.0  2309.37   
+2025-04-28    15637.63               95.60          3943  16855.0  2310.59   
+2025-04-29    15564.00               97.25          3911  16760.0  2305.52   
+2025-04-30    15342.50               97.50          3911  16600.0  2282.94   
+2025-05-01    15218.63               97.50          3881  16600.0  2282.94   
+
+            EUR_IDR       BTC_USD      FTSE100     HANGSENG    NIKKEI225  \
+Date                                                                       
+2015-05-01  14519.9    232.078995  6986.000000  28123.82031  19531.63086   
+2015-05-02  14519.9    234.929993  6986.000000  28123.82031  19531.63086   
+2015-05-03  14519.9    240.358002  6986.000000  28123.82031  19531.63086   
+2015-05-04  14467.5    239.018005  6986.000000  28123.82031  19531.63086   
+2015-05-05  14594.9    236.121002  6927.600098  27755.53906  19531.63086   
+...             ...           ...          ...          ...          ...   
+2025-04-27  19127.3  93754.843750  8415.299805  21980.74023  35705.73828   
+2025-04-28  19251.8  94978.750000  8417.299805  21971.96094  35839.98828   
+2025-04-29  19082.1  94284.789060  8463.500000  22008.10938  35839.98828   
+2025-04-30  18805.3  94207.312500  8494.900391  22119.41016  36045.37891   
+2025-05-01  18745.6  96492.335940  8496.799805  22119.41016  36452.30078   
+
+                 SNP500        DOW30  SSE_Composite         JKSE  
+Date                                                              
+2015-05-01  2108.290039  18024.06055    4480.463867  5140.937012  
+2015-05-02  2108.290039  18024.06055    4480.463867  5140.937012  
+2015-05-03  2108.290039  18024.06055    4480.463867  5140.937012  
+2015-05-04  2114.489990  18070.40039    4480.463867  5140.937012  
+2015-05-05  2089.459961  17928.19922    4298.706055  5160.107422  
+...                 ...          ...            ...          ...  
+2025-04-27  5525.209961  40113.50000    3295.060059  6678.915039  
+2025-04-28  5528.750000  40227.58984    3288.415039  6722.965820  
+2025-04-29  5560.830078  40527.62109    3286.655029  6749.075195  
+2025-04-30  5569.060059  40669.35938    3279.031006  6766.794922  
+2025-05-01  5604.140137  40752.96094    3279.031006  6766.794922  
+
+[3654 rows x 14 columns]
+--------------------------------------------------------------------------------
+Cell 4
+Cell type: code
+-- Code --
+plt.figure(figsize=(12, 7))
+plt.plot(df.index, df)
+plt.title(f"Dataset Plot")
+plt.xlabel("Date"); plt.ylabel("Price")
+plt.legend(labels=df.columns)
+plt.show()
+-- Outputs --
+[1] output_type: display_data
+<Figure size 1200x700 with 1 Axes>
+--------------------------------------------------------------------------------
+Cell 5
+Cell type: code
+-- Code --
+# ---------------- Split ----------------
+n = len(df)
+test_n = int(np.floor(TEST_SIZE * n))
+trainval_n = n - test_n
+val_n = int(np.floor(VAL_SIZE * trainval_n))
+train_n = trainval_n - val_n
+
+train_df = df.iloc[:train_n].copy()
+val_df   = df.iloc[train_n:train_n + val_n].copy()
+test_df  = df.iloc[train_n + val_n:].copy()
+
+print(f"Train: {len(train_df)} ({len(train_df)/len(df)*100:.1f}%) | "
+      f"Validation: {len(val_df)} ({len(val_df)/len(df)*100:.1f}%) | "
+      f"Test: {len(test_df)} ({len(test_df)/len(df)*100:.1f}%)")
+-- Outputs --
+[1] output_type: stream
+Train: 2632 (72.0%) | Validation: 292 (8.0%) | Test: 730 (20.0%)
+--------------------------------------------------------------------------------
+Cell 6
+Cell type: code
+-- Code --
+if INCLUDE_TARGET_AS_FEATURE:
+    feature_cols = df.columns.tolist()
+else:
+    feature_cols = [c for c in df.columns if c != TARGET_COL]
+feature_cols
+-- Outputs --
+[1] output_type: execute_result
+['Nickel_Fut',
+ 'Coal_Fut_Newcastle',
+ 'Palm_Oil_Fut',
+ 'USD_IDR',
+ 'CNY_IDR',
+ 'EUR_IDR',
+ 'BTC_USD',
+ 'FTSE100',
+ 'HANGSENG',
+ 'NIKKEI225',
+ 'SNP500',
+ 'DOW30',
+ 'SSE_Composite',
+ 'JKSE']
+--------------------------------------------------------------------------------
+Cell 7
+Cell type: code
+-- Code --
+X_scaler = StandardScaler()
+y_scaler = StandardScaler()
+X_scaler.fit(train_df[feature_cols])
+y_scaler.fit(train_df[[TARGET_COL]])
+
+def scale_block(block):
+    X = X_scaler.transform(block[feature_cols])
+    y = y_scaler.transform(block[[TARGET_COL]])
+    return pd.DataFrame(X, index=block.index, columns=feature_cols), pd.DataFrame(y, index=block.index, columns=[TARGET_COL])
+
+X_train_s, y_train_s = scale_block(train_df)
+X_val_s,   y_val_s   = scale_block(val_df)
+X_test_s,  y_test_s  = scale_block(test_df)
+--------------------------------------------------------------------------------
+Cell 8
+Cell type: code
+-- Code --
+def nll_gaussian_heteroscedastic(y_true, y_pred):
+    """
+    y_pred = (mu_s, log_var_s) in scaled space.
+    """
+    y_true = tf.cast(tf.reshape(y_true, (-1,)), tf.float32)  # flatten
+    mu      = y_pred[:, 0]
+    log_var = tf.clip_by_value(y_pred[:, 1], -20.0, 5.0)     # stability
+    inv_var = tf.exp(-log_var)
+    nll = 0.5 * (log_var + (y_true - mu)**2 * inv_var)
+    return tf.reduce_mean(nll)
+--------------------------------------------------------------------------------
+Cell 9
+Cell type: code
+-- Code --
+# ---------------- Utilities ----------------
+def make_windows(X_df, y_df, lookback: int):
+    X_vals = X_df.values
+    y_vals = y_df.values.squeeze()
+    idx = X_df.index
+    X_list, y_list, idx_list = [], [], []
+    for i in range(lookback, len(X_df)):
+        X_list.append(X_vals[i - lookback:i, :])
+        y_list.append(y_vals[i])  # predict t using t-lookback..t-1
+        idx_list.append(idx[i])
+    X_arr = np.array(X_list, dtype=np.float32)
+    y_arr = np.array(y_list, dtype=np.float32)
+    idx_arr = np.array(idx_list)
+    return X_arr, y_arr, idx_arr
+
+def positional_encoding(length, depth):
+    # depth must be even for sin/cos pairing
+    if depth % 2 != 0: depth += 1
+    positions = np.arange(length)[:, np.newaxis]
+    dims = np.arange(depth)[np.newaxis, :]
+    angle_rates = 1.0 / (10000 ** (2 * (dims//2) / depth))
+    angle_rads = positions * angle_rates
+    pe = np.zeros((length, depth), dtype=np.float32)
+    pe[:, 0::2] = np.sin(angle_rads[:, 0::2])
+    pe[:, 1::2] = np.cos(angle_rads[:, 1::2])
+    return tf.constant(pe)
+
+class AddPE(tf.keras.layers.Layer):
+    def __init__(self, lookback, d_model, **kwargs):
+        super().__init__(**kwargs)
+        self.lookback = lookback
+        self.d_model = d_model
+        self.pos = positional_encoding(lookback, d_model)
+    def call(self, x):
+        return x + self.pos
+
+def encoder_block(x, num_heads, d_model, dff, dropout_rate):
+    attn = MultiHeadAttention(num_heads=num_heads, key_dim=d_model//num_heads)(
+        x, x, use_causal_mask=True
+    )
+    x = Add()([x, Dropout(dropout_rate)(attn)])
+    x = LayerNormalization(epsilon=1e-6)(x)
+
+    ff = Dense(dff, activation="relu")(x)
+    ff = Dropout(dropout_rate)(ff)
+    ff = Dense(d_model)(ff)
+    x = Add()([x, Dropout(dropout_rate)(ff)])
+    x = LayerNormalization(epsilon=1e-6)(x)
+    return x
+
+def build_transformer(input_shape, params):
+    lb        = params["lookback"]
+    d_model   = params["d_model"]
+    num_heads = params["num_heads"]
+    dff       = params["dff"]
+    dropout   = params["dropout"]
+
+    inp = Input(shape=input_shape)
+    x = Dense(d_model)(inp)
+    x = AddPE(lb, d_model)(x)
+
+    for _ in range(params["num_layers"]):
+        x = encoder_block(
+            x,
+            num_heads=num_heads,
+            d_model=d_model,
+            dff=dff,
+            dropout_rate=dropout
+        )
+
+    x = Lambda(lambda t: t[:, -1, :])(x)
+
+    # Output heteroscedastic heads: mu_s, log_var_s
+    out = Dense(2)(x)
+
+    opt = Adam(learning_rate=params["lr"])
+    model = Model(inputs=inp, outputs=out)
+    model.compile(optimizer=opt, loss=nll_gaussian_heteroscedastic)
+    return model
+
+# Make sure d_model is divisible by num_heads
+def sample_divisible_pair(d_model_choices, head_choices):
+    for _ in range(50):
+        dm = random.choice(d_model_choices)
+        nh = random.choice(head_choices)
+        if dm % nh == 0:
+            return dm, nh
+    # fallback
+    return 64, 4
+
+def sample_params():
+    lookback = random.choice([30, 45, 60, 90])
+    d_model = random.choice([32, 64, 96, 128])
+    valid_heads = [h for h in (2, 4, 8) if d_model % h == 0 and d_model // h >= 8]
+    num_heads = random.choice(valid_heads)
+    dff = random.choice([2*d_model, 3*d_model, 4*d_model])
+
+    params = {
+        "lookback": lookback,
+        "d_model": d_model,
+        "num_heads": num_heads,
+        "dff": dff,
+        "num_layers": random.choice([1, 2, 3]),
+        "dropout": np.random.uniform(0.0, 0.3),
+        "optimizer": "adam",
+        "lr": 10 ** np.random.uniform(-4, math.log10(5e-3)),
+        "batch_size": random.choice([32, 64, 128]),
+        "epochs": random.choice([30, 40, 50, 60, 70, 80, 90, 100]),
+        "patience": random.choice([5, 6, 7, 8, 9, 10])
+    }
+
+    return params
+
+def compute_metrics(y_true, y_pred):
+    mse  = mean_squared_error(y_true, y_pred)
+    mae  = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mape = mean_absolute_percentage_error(y_true, y_pred)
+    r2   = r2_score(y_true, y_pred)
+    return [mse, mae, rmse, mape, r2]
+--------------------------------------------------------------------------------
+Cell 10
+Cell type: code
+-- Code --
+# ---------------- Random Search ----------------
+best = {"val_loss": np.inf, "params": None}
+
+print("\n=== Random Search (Transformer) begins ===")
+hpo_start = time.time()  # HPO timer starts
+for t in range(1, N_TRIALS + 1):
+    params = sample_params()
+
+    # Build windows with this trial's lookback
+    X_tr, y_tr, _ = make_windows(X_train_s, y_train_s, params["lookback"])
+    X_vl, y_vl, _ = make_windows(X_val_s,   y_val_s,   params["lookback"])
+
+    model = build_transformer((params["lookback"], len(feature_cols)), params)
+
+    callbacks = [
+        EarlyStopping(monitor="val_loss", patience=PATIENCE, restore_best_weights=True),
+    ]
+
+    start = time.time()
+    hist = model.fit(
+        X_tr, y_tr,
+        validation_data=(X_vl, y_vl),
+        epochs=params["epochs"],
+        batch_size=params["batch_size"],
+        callbacks=callbacks,
+        verbose=0
+    )
+    dur = time.time() - start
+
+    val_loss = float(min(hist.history["val_loss"]))
+    print(f"[Trial {t:02d}] lb={params['lookback']}, layers={params['num_layers']}, "
+          f"d_model={params['d_model']}, heads={params['num_heads']}, dff={params['dff']}, "
+          f"drop={params['dropout']}, opt={params['optimizer']}, lr={params['lr']}, "
+          f"bs={params['batch_size']}  => val_loss={val_loss:.6f} ({dur:.1f}s)")
+
+    if val_loss < best["val_loss"]:
+        best = {"val_loss": val_loss, "params": params}
+        model.save_weights(WEIGHTS_BEST)
+hpo_end = time.time()  # HPO timer ends
+hpo_time_s = float(hpo_end - hpo_start)
+hpo_trials = N_TRIALS
+
+print("\nBest val_loss:", best["val_loss"])
+print("Best params:\n", json.dumps(best["params"], indent=2))
+-- Outputs --
+[1] output_type: stream
+
+=== Random Search (Transformer) begins ===
+[Trial 01] lb=30, layers=1, d_model=32, heads=4, dff=64, drop=0.11236203565420874, opt=adam, lr=0.004123206532618723, bs=32  => val_loss=-1.484459 (10.6s)
+[Trial 02] lb=30, layers=3, d_model=64, heads=8, dff=256, drop=0.21959818254342153, opt=adam, lr=0.0010401663679887308, bs=128  => val_loss=-2.016092 (82.7s)
+[Trial 03] lb=90, layers=3, d_model=32, heads=4, dff=128, drop=0.04680559213273095, opt=adam, lr=0.0001840899208055252, bs=64  => val_loss=-1.258893 (83.8s)
+
+Best val_loss: -2.016092300415039
+Best params:
+ {
+  "lookback": 30,
+  "d_model": 64,
+  "num_heads": 8,
+  "dff": 256,
+  "num_layers": 3,
+  "dropout": 0.21959818254342153,
+  "optimizer": "adam",
+  "lr": 0.0010401663679887308,
+  "batch_size": 128,
+  "epochs": 90,
+  "patience": 6
+}
+--------------------------------------------------------------------------------
+Cell 11
+Cell type: code
+-- Code --
+# ---------------- Retrain best on TRAIN+VAL & Evaluate on TEST ----------------
+lb = best["params"]["lookback"]
+X_trainval_s = pd.concat([X_train_s, X_val_s], axis=0)
+y_trainval_s = pd.concat([y_train_s, y_val_s], axis=0)
+
+X_trv, y_trv, _ = make_windows(X_trainval_s, y_trainval_s, lb)
+X_te,  y_te,  idx_te  = make_windows(X_test_s,      y_test_s,      lb)
+
+best_model = build_transformer((lb, len(feature_cols)), best["params"])
+
+callbacks_final = [
+    EarlyStopping(monitor="val_loss", patience=PATIENCE, restore_best_weights=True),
+    ModelCheckpoint(MODEL_BEST, monitor="val_loss", save_best_only=True),
+    # ModelCheckpoint(WEIGHTS_BEST, monitor="val_loss", save_best_only=True, save_weights_only=True),
+]
+
+start_train = time.time()
+hist_final = best_model.fit(
+    X_trv, y_trv,
+    validation_split=0.1,
+    epochs=best["params"]["epochs"],
+    batch_size=best["params"]["batch_size"],
+    callbacks=callbacks_final,
+    verbose=VERBOSE_TRAIN
+)
+end_train = time.time()
+print(f"Final training time: {end_train - start_train:.2f} s")
+-- Outputs --
+[1] output_type: stream
+Epoch 1/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m9s[0m 127ms/step - loss: 0.7946 - val_loss: -0.4436
+Epoch 2/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 97ms/step - loss: -0.2944 - val_loss: -0.8466
+Epoch 3/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 95ms/step - loss: -0.5592 - val_loss: -1.0617
+Epoch 4/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 97ms/step - loss: -0.7189 - val_loss: -1.1592
+Epoch 5/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 101ms/step - loss: -0.9297 - val_loss: -1.2864
+Epoch 6/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 90ms/step - loss: -0.9876 - val_loss: -1.1247
+Epoch 7/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 95ms/step - loss: -1.1161 - val_loss: -1.3013
+Epoch 8/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 95ms/step - loss: -1.0691 - val_loss: -1.4994
+Epoch 9/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 88ms/step - loss: -1.2260 - val_loss: -0.4185
+Epoch 10/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 90ms/step - loss: -1.2905 - val_loss: -0.6370
+Epoch 11/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 93ms/step - loss: -1.3129 - val_loss: -1.5561
+Epoch 12/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 100ms/step - loss: -1.3637 - val_loss: -0.6783
+Epoch 13/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 96ms/step - loss: -1.4790 - val_loss: -1.3220
+Epoch 14/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 94ms/step - loss: -1.4815 - val_loss: -1.2831
+Epoch 15/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 90ms/step - loss: -1.5267 - val_loss: -1.1964
+Epoch 16/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 96ms/step - loss: -1.6342 - val_loss: -1.6352
+Epoch 17/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 92ms/step - loss: -1.6154 - val_loss: -1.1556
+Epoch 18/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 88ms/step - loss: -1.6662 - val_loss: -1.6052
+Epoch 19/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 96ms/step - loss: -1.6626 - val_loss: -1.7446
+Epoch 20/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 96ms/step - loss: -1.6335 - val_loss: -1.5996
+Epoch 21/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 89ms/step - loss: -1.7486 - val_loss: -1.5312
+Epoch 22/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 91ms/step - loss: -1.6681 - val_loss: -1.3778
+Epoch 23/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 89ms/step - loss: -1.7784 - val_loss: -0.8348
+Epoch 24/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 87ms/step - loss: -1.8785 - val_loss: 0.4440
+Epoch 25/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 87ms/step - loss: -1.8401 - val_loss: -0.1878
+Epoch 26/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 87ms/step - loss: -1.8560 - val_loss: -1.3036
+Epoch 27/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 87ms/step - loss: -1.9179 - val_loss: -1.7220
+Epoch 28/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 86ms/step - loss: -1.8677 - val_loss: 1.3593
+Epoch 29/90
+[1m21/21[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 89ms/step - loss: -1.8614 - val_loss: -0.6369
+Final training time: 64.12 s
+--------------------------------------------------------------------------------
+Cell 12
+Cell type: code
+-- Code --
+# Heteroscedastic Prediction (mu, sigma_ale)
+start_test = time.time()
+yhat_s = best_model.predict(X_te, verbose=1)  # (N, 2)
+
+mu_s      = yhat_s[:, 0]
+log_var_s = yhat_s[:, 1]
+
+# scale back to original
+y_mean = y_scaler.mean_[0]
+y_std  = y_scaler.scale_[0]
+
+mu_orig = mu_s * y_std + y_mean
+var_orig = np.exp(log_var_s) * (y_std ** 2)
+sigma_ale = np.sqrt(var_orig)
+
+pred_test = pd.DataFrame({
+    "mu": mu_orig,
+    "sigma_ale": sigma_ale
+}, index=idx_te)
+
+end_test = time.time()
+print(f"Testing (inference) time: {end_test - start_test:.4f} s")
+-- Outputs --
+[1] output_type: stream
+[1m22/22[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 22ms/step
+Testing (inference) time: 0.7941 s
+--------------------------------------------------------------------------------
+Cell 13
+Cell type: code
+-- Code --
+# Last-Layer Laplace Approximation (LLLA) — Transformer
+# Penultimate layer = layers[-2]
+penultimate_layer = best_model.layers[-2]
+
+phi_model = tf.keras.Model(
+    inputs=best_model.inputs[0],
+    outputs=penultimate_layer.output
+)
+
+phi_test  = phi_model.predict(X_te, verbose=0)
+phi_trainval = phi_model.predict(X_trv, verbose=0)
+
+print("phi_trainval:", phi_trainval.shape)
+print("phi_test:", phi_test.shape)
+-- Outputs --
+[1] output_type: stream
+phi_trainval: (2894, 64)
+phi_test: (700, 64)
+--------------------------------------------------------------------------------
+Cell 14
+Cell type: code
+-- Code --
+# scaled-space mu for train/val
+yhat_trainval_s = best_model.predict(X_trv, verbose=0)
+mu_trainval_s   = yhat_trainval_s[:, 0]
+
+y_trainval_s_flat = y_trv.squeeze()
+
+residuals_s = y_trainval_s_flat - mu_trainval_s
+sigma_n2 = np.mean(residuals_s ** 2)
+print("Estimated noise variance (scaled):", sigma_n2)
+-- Outputs --
+[1] output_type: stream
+Estimated noise variance (scaled): 0.013693728
+--------------------------------------------------------------------------------
+Cell 15
+Cell type: code
+-- Code --
+N_tr, H = phi_trainval.shape
+
+Phi_tr = np.concatenate([phi_trainval, np.ones((N_tr,1))], axis=1)
+lambda_prior = 1.0
+
+H_diag = (1.0 / sigma_n2) * np.sum(Phi_tr**2, axis=0) + lambda_prior
+var_w_diag = 1.0 / H_diag
+--------------------------------------------------------------------------------
+Cell 16
+Cell type: code
+-- Code --
+def compute_sigma_epi(phi_block, idx_block):
+    N, H = phi_block.shape
+    Phi_b = np.concatenate([phi_block, np.ones((N,1))], axis=1)
+    var_epi_scaled = np.sum((Phi_b**2) * var_w_diag.reshape(1,-1), axis=1)
+    var_epi_orig   = var_epi_scaled * (y_scaler.scale_[0] ** 2)
+    return pd.Series(np.sqrt(np.maximum(var_epi_orig, 1e-12)), index=idx_block)
+
+sigma_epi_test = compute_sigma_epi(phi_test, idx_te)
+--------------------------------------------------------------------------------
+Cell 17
+Cell type: code
+-- Code --
+pred_test["sigma_epi"] = sigma_epi_test
+pred_test["sigma_total"] = np.sqrt(pred_test["sigma_ale"]**2 + pred_test["sigma_epi"]**2)
+
+pred_test.head()
+-- Outputs --
+[1] output_type: execute_result
+                     mu  sigma_ale  sigma_epi  sigma_total
+2023-06-02  6649.241211  67.682297  11.899974    68.720466
+2023-06-03  6651.268555  67.539658  11.840322    68.569663
+2023-06-04  6651.198242  67.427994  11.839480    68.459532
+2023-06-05  6655.311035  67.395302  11.857922    68.430525
+2023-06-06  6642.547363  67.591026  11.735722    68.602289
+--------------------------------------------------------------------------------
+Cell 18
+Cell type: code
+-- Code --
+actual = df[TARGET_COL]
+actual_test = actual.loc[idx_te]
+
+metrics_test = compute_metrics(actual_test.values, pred_test["mu"].values)
+
+metrics_df = pd.DataFrame([metrics_test],
+    columns=["MSE","MAE","RMSE","MAPE","R²"],
+    index=["Test (best cfg)"]
+)
+
+print("\n=== Metrics (Transformer — HLLLA) ===")
+print(metrics_df)
+-- Outputs --
+[1] output_type: stream
+
+=== Metrics (Transformer — HLLLA) ===
+                           MSE        MAE        RMSE      MAPE        R²
+Test (best cfg)  221480.649888  422.86255  470.617307  0.058697 -0.964872
+--------------------------------------------------------------------------------
+Cell 19
+Cell type: code
+-- Code --
+def compute_pi_metrics_from_sigma(y_true, mu, sigma, z_level=1.96, alpha=0.05):
+    """
+    Compute PICP, MPIW, Winkler Score from μ and σ_total.
+    y_true, mu, sigma must be original-scale arrays.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    mu     = np.asarray(mu, dtype=float)
+    sigma  = np.asarray(sigma, dtype=float)
+
+    # 1) Interval
+    L = mu - z_level * sigma
+    U = mu + z_level * sigma
+
+    # 2) Coverage
+    inside = (y_true >= L) & (y_true <= U)
+    picp = inside.mean()
+
+    # 3) Width
+    width = U - L
+    mpiw = width.mean()
+
+    # 4) Winkler score
+    penalties = np.zeros_like(y_true)
+
+    below = y_true < L
+    above = y_true > U
+
+    penalties[below] = (L[below] - y_true[below])
+    penalties[above] = (y_true[above] - U[above])
+
+    winkler = np.mean(width + (2.0 / alpha) * penalties)
+
+    return picp, mpiw, winkler
+
+trans_picp_test, trans_mpiw_test, trans_wink_test = compute_pi_metrics_from_sigma(
+    actual_test.values,
+    pred_test["mu"].values,
+    pred_test["sigma_total"].values,
+    z_level=Z_LEVEL,
+    alpha=ALPHA
+)
+
+print("\n=== UQ Interval Metrics (Transformer — Heteroscedastic + LLLA) ===")
+print(f"TEST  — PICP: {trans_picp_test:.4f} | MPIW: {trans_mpiw_test:.4f} | Winkler: {trans_wink_test:.4f}")
+-- Outputs --
+[1] output_type: stream
+
+=== UQ Interval Metrics (Transformer — Heteroscedastic + LLLA) ===
+TEST  — PICP: 0.0729 | MPIW: 281.0801 | Winkler: 11793.8493
+--------------------------------------------------------------------------------
+Cell 20
+Cell type: code
+-- Code --
+# Convenience aliases
+# mu_train = pred_train["mu"]
+# mu_val   = pred_val["mu"]
+mu_test  = pred_test["mu"]
+
+# sigma_ale_train = pred_train["sigma_ale"]
+# sigma_ale_val   = pred_val["sigma_ale"]
+sigma_ale_test  = pred_test["sigma_ale"]
+
+# sigma_epi_train  = pred_train["sigma_epi"]
+# sigma_epi_val    = pred_val["sigma_epi"]
+sigma_epi_test   = pred_test["sigma_epi"]
+
+# sigma_total_train = pred_train["sigma_total"]
+# sigma_total_val   = pred_val["sigma_total"]
+sigma_total_test  = pred_test["sigma_total"]
+
+# Build total intervals for test set
+L_test = mu_test - Z_LEVEL * sigma_total_test
+U_test = mu_test + Z_LEVEL * sigma_total_test
+
+# (1) ALL ACTUAL vs PREDICTED (Train / Val / Test)
+plt.figure(figsize=(12, 5))
+plt.plot(actual.index, actual.values, label="Actual (JKSE)", linewidth=1)
+# plt.plot(mu_train.index, mu_train.values, label="Predicted (Train)", linewidth=1)
+# plt.plot(mu_val.index,   mu_val.values,   label="Predicted (Val)", linewidth=1)
+plt.plot(mu_test.index,  mu_test.values,  label="Predicted (Test)", linewidth=1.5)
+plt.title("All Actual vs Predicted — LSTM Hetero + LLLA")
+plt.xlabel("Date"); plt.ylabel("JKSE")
+plt.legend(); plt.tight_layout(); plt.show()
+
+# (2) INSIDE (GREEN) / OUTSIDE (RED) — TEST ONLY
+y_true_test = actual_test
+
+inside_mask = (y_true_test >= L_test) & (y_true_test <= U_test)
+outside_mask = ~inside_mask
+
+plt.figure(figsize=(12, 5))
+plt.plot(y_true_test.index, y_true_test.values, color="gray", alpha=0.4, label="Actual (Test)")
+
+plt.scatter(
+    y_true_test.index[inside_mask],
+    y_true_test.values[inside_mask],
+    s=15,
+    color="limegreen",
+    label="Inside Interval"
+)
+
+plt.scatter(
+    y_true_test.index[outside_mask],
+    y_true_test.values[outside_mask],
+    s=20,
+    color="red",
+    label="Outside Interval"
+)
+
+plt.plot(mu_test.index, mu_test.values, label="Predicted Mean", linewidth=1.5)
+plt.fill_between(mu_test.index, L_test.values, U_test.values, alpha=0.2, label="95% CI (Total)")
+plt.title("Inside / Outside Interval — Test (LSTM Hetero + LLLA)")
+plt.xlabel("Date"); plt.ylabel("JKSE")
+plt.legend(); plt.tight_layout(); plt.show()
+
+# (3) UNCERTAINTY DECOMPOSITION — TEST
+plt.figure(figsize=(12, 5))
+plt.plot(sigma_ale_test.index,   sigma_ale_test.values,   label="Aleatoric σ_ale", alpha=0.8)
+plt.plot(sigma_epi_test.index,   sigma_epi_test.values,   label="Epistemic σ_epi", alpha=0.8)
+plt.plot(sigma_total_test.index, sigma_total_test.values, label="Total σ", linewidth=2)
+plt.title("Uncertainty Decomposition — Test (LSTM Hetero + LLLA)")
+plt.xlabel("Date"); plt.ylabel("Std (JKSE units)")
+plt.legend(); plt.tight_layout(); plt.show()
+
+# (4) RESIDUALS OVER TIME — TEST
+residuals_test = y_true_test.values - mu_test.values
+
+plt.figure(figsize=(12, 4))
+plt.plot(y_true_test.index, residuals_test, linewidth=1)
+plt.axhline(0, linestyle="--", linewidth=1, color="black")
+plt.title("Residuals Over Time — Test (Actual - Predicted) — LSTM")
+plt.xlabel("Date"); plt.ylabel("Residual")
+plt.tight_layout(); plt.show()
+
+# (5) COVERAGE HEATMAP (PER-WINDOW) — TEST
+y_true = y_true_test.values
+L_arr  = L_test.values
+U_arr  = U_test.values
+
+below_mask  = (y_true < L_arr)
+above_mask  = (y_true > U_arr)
+inside_mask = (y_true >= L_arr) & (y_true <= U_arr)
+
+status = np.zeros_like(y_true, dtype=float)
+status[below_mask] = -1
+status[above_mask] = 1
+
+starts = np.arange(0, len(status) - HEAT_WIN + 1, HEAT_STRIDE)
+if len(starts) == 0:
+    starts = np.array([0])
+    HEAT_WIN = len(status)
+
+mat = []
+x_tick_labels = []
+
+for s in starts:
+    e = min(s + HEAT_WIN, len(status))
+    row = status[s:e]
+    if e - s < HEAT_WIN:
+        row = np.pad(row, (0, HEAT_WIN - (e - s)), constant_values=np.nan)
+    mat.append(row)
+    x_tick_labels.append(y_true_test.index[s].strftime("%Y-%m-%d"))
+
+mat = np.vstack(mat)
+
+cmap = ListedColormap(["#d62728", "#2ca02c", "#ff7f0e", "#bdbdbd"])
+bounds = [-1.5, -0.5, 0.5, 1.5, 2.5]
+norm = BoundaryNorm(bounds, cmap.N)
+
+plt.figure(figsize=(12, 6))
+plt.imshow(mat, aspect="auto", interpolation="nearest", cmap=cmap, norm=norm)
+plt.title(f"Coverage Heatmap (Test) — LSTM Hetero + LLLA — window={HEAT_WIN}, stride={HEAT_STRIDE}\n-1: Below | 0: Inside | +1: Above")
+plt.xlabel("Position inside window")
+plt.ylabel("Window start time")
+
+yticks = np.arange(0, len(starts), max(1, len(starts) // 10))
+plt.yticks(yticks, [x_tick_labels[i] for i in yticks])
+
+legend_patches = [
+    mpatches.Patch(color="#2ca02c", label="Inside PI"),
+    mpatches.Patch(color="#d62728", label="Below lower"),
+    mpatches.Patch(color="#ff7f0e", label="Above upper"),
+    mpatches.Patch(color="#bdbdbd", label="Padding"),
+]
+plt.legend(handles=legend_patches, loc="upper right", frameon=True)
+plt.tight_layout(); plt.show()
+
+# (6) ROLLING PICP — TEST (Total intervals)
+covered = ((y_true_test >= L_test) & (y_true_test <= U_test)).astype(int)
+rolling_picp = covered.rolling(ROLL_WIN).mean()
+
+plt.figure(figsize=(12, 4))
+plt.plot(rolling_picp.index, rolling_picp.values, label=f"Rolling PICP (win={ROLL_WIN})")
+plt.axhline(0.95, color="red", linestyle="--", label="Nominal 95%")
+plt.title("Rolling PICP — Test (LSTM Hetero + LLLA)")
+plt.xlabel("Date"); plt.ylabel("Coverage")
+plt.ylim(0, 1)
+plt.legend()
+plt.tight_layout(); plt.show()
+
+# (7) ROLLING MPIW — TEST (Total intervals)
+width = (U_test - L_test)
+rolling_mpiw = width.rolling(ROLL_WIN).mean()
+
+plt.figure(figsize=(12, 4))
+plt.plot(rolling_mpiw.index, rolling_mpiw.values, label=f"Rolling MPIW (win={ROLL_WIN})")
+plt.title("Rolling MPIW — Test (LSTM Hetero + LLLA)")
+plt.xlabel("Date"); plt.ylabel("Interval Width")
+plt.legend()
+plt.tight_layout(); plt.show()
+
+# (8) ROLLING PICP + NORMALIZED MPIW — TEST
+mpiwn = (rolling_mpiw - rolling_mpiw.min()) / (rolling_mpiw.max() - rolling_mpiw.min() + 1e-12)
+
+plt.figure(figsize=(12, 4))
+plt.plot(rolling_picp.index, rolling_picp.values, label="Rolling PICP", linewidth=2)
+plt.plot(mpiwn.index, mpiwn.values, label="Normalized MPIW", linewidth=2)
+plt.axhline(0.95, color="red", linestyle="--", label="Nominal 95%")
+plt.title("Rolling PICP vs Normalized MPIW — Test (LSTM Hetero + LLLA)")
+plt.xlabel("Date"); plt.ylabel("Value")
+plt.ylim(0, 1.1)
+plt.legend()
+plt.tight_layout(); plt.show()
+-- Outputs --
+[1] output_type: display_data
+<Figure size 1200x500 with 1 Axes>
+[2] output_type: display_data
+<Figure size 1200x500 with 1 Axes>
+[3] output_type: display_data
+<Figure size 1200x500 with 1 Axes>
+[4] output_type: display_data
+<Figure size 1200x400 with 1 Axes>
+[5] output_type: display_data
+<Figure size 1200x600 with 1 Axes>
+[6] output_type: display_data
+<Figure size 1200x400 with 1 Axes>
+[7] output_type: display_data
+<Figure size 1200x400 with 1 Axes>
+[8] output_type: display_data
+<Figure size 1200x400 with 1 Axes>
+--------------------------------------------------------------------------------
