@@ -1,0 +1,913 @@
+Notebook: GRU_MCD_42.ipynb
+Kernelspec: {'display_name': 'tesis_env', 'language': 'python', 'name': 'python3'}
+
+--------------------------------------------------------------------------------
+Cell 1
+Cell type: code
+-- Code --
+import os
+import time
+import json
+import math
+import random
+from typing import Tuple, Dict
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import tensorflow as tf
+from tensorflow.keras import Sequential, Input, optimizers
+from tensorflow.keras.layers import GRU, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, mean_absolute_percentage_error
+
+import optuna
+from optuna.integration import TFKerasPruningCallback
+--------------------------------------------------------------------------------
+Cell 2
+Cell type: code
+-- Code --
+# --------------------------- User Config ---------------------------
+CSV_PATH   = "ALL_MERGED.csv"
+DATE_COL   = "Date"
+TARGET_COL = "JKSE"
+INCLUDE_TARGET_AS_FEATURE = True
+
+TEST_SIZE  = 0.20
+VAL_SIZE   = 0.10
+
+N_TRIALS   = 50                 # make larger for exhaustive search
+RANDOM_SEED = 42
+USE_PROGRESS_BAR = True
+
+# MC Dropout
+N_MC       = 100                # per user's request
+ALPHA      = 0.05               # 90% PI is common for finance; change to 0.05 for 95%
+USE_QUANTILES = True            # True: empirical quantiles; False: Gaussian approx
+
+# Visuals
+DO_PLOTS   = True
+
+# Output
+CKPT_DIR   = "Model Checkpoints"
+CKPT_PATH  = os.path.join(CKPT_DIR, "gru_optuna_best.keras")
+RESULTS_DIR = "Results"
+os.makedirs(CKPT_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR, exist_ok=True)
+--------------------------------------------------------------------------------
+Cell 3
+Cell type: code
+-- Code --
+# --------------------------- Reproducibility ---------------------------
+def load_seed_from_file(seed_file: str) -> int:
+    if not os.path.exists(seed_file):
+        raise FileNotFoundError(f"Seed file not found: {seed_file}")
+    with open(seed_file, "r") as f:
+        s = int(f.read().strip())
+    return s
+
+def set_global_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+--------------------------------------------------------------------------------
+Cell 4
+Cell type: code
+-- Code --
+# --------------------------- Data Loading ---------------------------
+def load_dataset(csv_path: str) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+    required = [
+        "Date", "Nickel_Fut", "Coal_Fut_Newcastle", "Palm_Oil_Fut",
+        "USD_IDR", "CNY_IDR", "EUR_IDR", "BTC_USD",
+        "FTSE100", "HANGSENG", "NIKKEI225", "SNP500", "DOW30", "SSE_Composite", TARGET_COL
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns in CSV: {missing}")
+
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL])
+    df = df.sort_values(DATE_COL).set_index(DATE_COL)
+    df = df.ffill().bfill()
+    return df
+
+def split_df(df: pd.DataFrame, test_size: float, val_size: float):
+    n = len(df)
+    test_n = int(np.floor(test_size * n))
+    trainval_n = n - test_n
+    val_n = int(np.floor(val_size * trainval_n))
+    train_n = trainval_n - val_n
+
+    train_df = df.iloc[:train_n].copy()
+    val_df   = df.iloc[train_n:train_n + val_n].copy()
+    test_df  = df.iloc[train_n + val_n:].copy()
+    return train_df, val_df, test_df
+--------------------------------------------------------------------------------
+Cell 5
+Cell type: code
+-- Code --
+# --------------------------- Scaling & Windows ---------------------------
+def get_feature_cols(df: pd.DataFrame, include_target: bool) -> list:
+    return df.columns.tolist() if include_target else [c for c in df.columns if c != TARGET_COL]
+
+def fit_scalers(train_df: pd.DataFrame, feature_cols: list):
+    X_scaler = StandardScaler().fit(train_df[feature_cols])
+    y_scaler = StandardScaler().fit(train_df[[TARGET_COL]])
+    return X_scaler, y_scaler
+
+def scale_block(block: pd.DataFrame, feature_cols: list, X_scaler: StandardScaler, y_scaler: StandardScaler):
+    X = X_scaler.transform(block[feature_cols])
+    y = y_scaler.transform(block[[TARGET_COL]])
+    return (pd.DataFrame(X, index=block.index, columns=feature_cols),
+            pd.DataFrame(y, index=block.index, columns=[TARGET_COL]))
+
+def make_windows(X_df: pd.DataFrame, y_df: pd.DataFrame, lookback: int):
+    X_vals = X_df.values
+    y_vals = y_df.values.squeeze()
+    idx = X_df.index
+
+    X_list, y_list, idx_list = [], [], []
+    for i in range(lookback, len(X_df)):
+        X_list.append(X_vals[i - lookback:i, :])
+        y_list.append(y_vals[i])
+        idx_list.append(idx[i])
+
+    X_arr = np.array(X_list, dtype=np.float32)
+    y_arr = np.array(y_list, dtype=np.float32)
+    idx_arr = np.array(idx_list)
+    return X_arr, y_arr, idx_arr
+--------------------------------------------------------------------------------
+Cell 6
+Cell type: code
+-- Code --
+# --------------------------- Metrics ---------------------------
+def base_metrics(y_true, y_pred) -> Dict[str, float]:
+    mse  = mean_squared_error(y_true, y_pred)
+    mae  = mean_absolute_error(y_true, y_pred)
+    rmse = float(np.sqrt(mse))
+    mape = mean_absolute_percentage_error(y_true, y_pred)
+    r2   = r2_score(y_true, y_pred)
+    return dict(MSE=float(mse), MAE=float(mae), RMSE=rmse, MAPE=float(mape), R2=float(r2))
+
+def uq_metrics(y_true, L, U, alpha=0.10) -> Dict[str, float]:
+    y = np.asarray(y_true); L = np.asarray(L); U = np.asarray(U)
+    cover = (y >= L) & (y <= U)
+    picp = float(cover.mean())
+    mpiw = float(np.mean(U - L))
+    penalty = np.where(y < L, (2/alpha)*(L - y),
+              np.where(y > U, (2/alpha)*(y - U), 0.0))
+    winkler = float(np.mean((U - L) + penalty))
+    return dict(PICP=picp, MPIW=mpiw, Winkler=winkler)
+--------------------------------------------------------------------------------
+Cell 7
+Cell type: code
+-- Code --
+# --------------------------- Model Builders ---------------------------
+def build_gru_from_trial(trial, lookback, n_features):
+    num_layers = trial.suggest_int("num_layers", 1, 2)
+    units1     = trial.suggest_int("units1", 32, 256, step=32)
+    units2     = trial.suggest_int("units2", 32, 256, step=32) if num_layers == 2 else None
+    dropout    = trial.suggest_float("dropout", 0.0, 0.5)
+    lr         = trial.suggest_float("lr", 1e-4, 5e-3, log=True)
+
+    m = Sequential()
+    m.add(Input(shape=(lookback, n_features)))
+    if num_layers == 2:
+        m.add(GRU(units1, return_sequences=True))
+        m.add(Dropout(dropout))
+        m.add(GRU(units2))
+    else:
+        m.add(GRU(units1))
+    m.add(Dropout(dropout))  # <-- This is the same dropout Optuna tunes. We'll keep it for MC.
+    m.add(Dense(1))
+    m.compile(optimizer=optimizers.Adam(learning_rate=lr), loss="mse")
+    return m
+
+def build_gru_fixed(best_params: dict, lookback: int, n_features: int):
+    m = Sequential()
+    m.add(Input(shape=(lookback, n_features)))
+    if best_params.get("num_layers", 1) == 2:
+        m.add(GRU(best_params["units1"], return_sequences=True))
+        m.add(Dropout(best_params["dropout"]))
+        m.add(GRU(best_params["units2"]))
+    else:
+        m.add(GRU(best_params["units1"]))
+    m.add(Dropout(best_params["dropout"]))
+    m.add(Dense(1))
+    m.compile(optimizer=optimizers.Adam(learning_rate=best_params["lr"]), loss="mse")
+    return m
+--------------------------------------------------------------------------------
+Cell 8
+Cell type: code
+-- Code --
+# --------------------------- Optuna Objective ---------------------------
+def make_objective(X_train_s, y_train_s, X_val_s, y_val_s, n_features):
+    def objective(trial):
+        lookback = trial.suggest_categorical("lookback", [30, 45, 60, 90])
+        X_tr, y_tr, _ = make_windows(X_train_s, y_train_s, lookback)
+        X_va, y_va, _ = make_windows(X_val_s,   y_val_s,   lookback)
+
+        batch_size = trial.suggest_categorical("batch_size", [32, 64, 128])
+        epochs     = trial.suggest_int("epochs", 30, 100, step=10)
+        patience   = trial.suggest_int("patience", 5, 10)
+
+        model = build_gru_from_trial(trial, lookback, n_features=n_features)
+        callbacks = [
+            EarlyStopping(monitor="val_loss", patience=patience, restore_best_weights=True),
+            TFKerasPruningCallback(trial, monitor="val_loss"),
+        ]
+
+        history = model.fit(
+            X_tr, y_tr,
+            validation_data=(X_va, y_va),
+            epochs=epochs,
+            batch_size=batch_size,
+            verbose=0,
+            callbacks=callbacks
+        )
+        return float(min(history.history["val_loss"]))
+    return objective
+--------------------------------------------------------------------------------
+Cell 9
+Cell type: code
+-- Code --
+# --------------------------- Deterministic Predictions ---------------------------
+def predict_series(model, X_block, idx_block, y_scaler):
+    yhat_s = model.predict(X_block, verbose=0)
+    yhat = y_scaler.inverse_transform(yhat_s).squeeze()
+    return pd.Series(yhat, index=idx_block, name="Pred")
+--------------------------------------------------------------------------------
+Cell 10
+Cell type: code
+-- Code --
+# --------------------------- MC Dropout ---------------------------
+@tf.function
+def mc_call(m, X, training=True):
+    # important: training=True keeps dropout active at inference
+    return m(X, training=training)
+
+def predict_mc(model, X_np, idx, y_mean: float, y_scale: float,
+               n_mc: int = 100, use_quantiles: bool = True, alpha: float = 0.10):
+    Ys_scaled = []
+    X_tf = tf.convert_to_tensor(X_np, dtype=tf.float32)
+    for _ in range(n_mc):
+        y_s = mc_call(model, X_tf, training=True).numpy().squeeze()  # (N,)
+        Ys_scaled.append(y_s)
+    Ys_scaled = np.stack(Ys_scaled, axis=1)  # (N, T)
+    Ys = Ys_scaled * y_scale + y_mean        # inverse scale: y = z*scale + mean
+
+    mean = Ys.mean(axis=1)
+    std  = Ys.std(axis=1, ddof=1)
+    if use_quantiles:
+        lower = np.quantile(Ys, q=alpha/2, axis=1)
+        upper = np.quantile(Ys, q=1 - alpha/2, axis=1)
+    else:
+        from scipy.stats import norm
+        z = norm.ppf(1 - alpha/2.0)
+        lower, upper = mean - z*std, mean + z*std
+
+    return (
+        pd.Series(mean,  index=idx, name="mean"),
+        pd.Series(lower, index=idx, name=f"lower_{int((1-alpha)*100)}"),
+        pd.Series(upper, index=idx, name=f"upper_{int((1-alpha)*100)}"),
+        pd.Series(std,   index=idx, name="mc_std"),
+        Ys  # raw MC draws in real scale: shape (N, T)
+    )
+--------------------------------------------------------------------------------
+Cell 11
+Cell type: code
+-- Code --
+# --------------------------- Main ---------------------------
+def main():
+    # Seed
+    print("Seed:", RANDOM_SEED)
+    set_global_seed(RANDOM_SEED)
+
+    # Data
+    df = load_dataset(CSV_PATH)
+    train_df, val_df, test_df = split_df(df, TEST_SIZE, VAL_SIZE)
+
+    feature_cols = get_feature_cols(df, INCLUDE_TARGET_AS_FEATURE)
+    X_scaler, y_scaler = fit_scalers(train_df, feature_cols)
+
+    X_train_s, y_train_s = scale_block(train_df, feature_cols, X_scaler, y_scaler)
+    X_val_s,   y_val_s   = scale_block(val_df,   feature_cols, X_scaler, y_scaler)
+    X_test_s,  y_test_s  = scale_block(test_df,  feature_cols, X_scaler, y_scaler)
+
+    y_mean, y_scale = float(y_scaler.mean_[0]), float(y_scaler.scale_[0])
+
+    # ------------------ Optuna ------------------
+    print("\n[Optuna] Starting study...")
+    sampler = optuna.samplers.TPESampler(seed=RANDOM_SEED)
+    pruner  = optuna.pruners.MedianPruner(n_warmup_steps=5)
+    study   = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
+
+    objective = make_objective(X_train_s, y_train_s, X_val_s, y_val_s, n_features=len(feature_cols))
+    study.optimize(objective, n_trials=N_TRIALS, show_progress_bar=USE_PROGRESS_BAR)
+    best_params = study.best_params
+    BEST_LOOKBACK = best_params["lookback"]
+    print("[Optuna] Best params:", best_params)
+
+    # ------------------ Windows with best lookback ------------------
+    X_train_w, y_train_w, idx_train = make_windows(X_train_s, y_train_s, BEST_LOOKBACK)
+    X_val_w,   y_val_w,   idx_val   = make_windows(X_val_s,   y_val_s,   BEST_LOOKBACK)
+    X_test_w,  y_test_w,  idx_test  = make_windows(X_test_s,  y_test_s,  BEST_LOOKBACK)
+
+    # ------------------ Final deterministic training ------------------
+    final_model = build_gru_fixed(best_params, BEST_LOOKBACK, len(feature_cols))
+    callbacks = [
+        EarlyStopping(monitor="val_loss", patience=best_params["patience"], restore_best_weights=True),
+        ModelCheckpoint(CKPT_PATH, monitor="val_loss", save_best_only=True)
+    ]
+
+    print("\n[Train] Retraining final GRU with best params...")
+    t0 = time.time()
+    history = final_model.fit(
+        X_train_w, y_train_w,
+        validation_data=(X_val_w, y_val_w),
+        epochs=best_params["epochs"],
+        batch_size=best_params["batch_size"],
+        verbose=1,
+        callbacks=callbacks
+    )
+    print(f"[Train] Done in {time.time()-t0:.2f}s")
+
+    # ------------------ Deterministic predictions (for Stage 1 comparability) ------------------
+    # IMPORTANT: Use the SAME model weights (no re-seeding, no re-train)
+    actual = df[TARGET_COL]
+    actual_train = actual.loc[idx_train]
+    actual_val   = actual.loc[idx_val]
+    actual_test  = actual.loc[idx_test]
+
+    pred_train_det = predict_series(final_model, X_train_w, idx_train, y_scaler)
+    pred_val_det   = predict_series(final_model, X_val_w,   idx_val,   y_scaler)
+    pred_test_det  = predict_series(final_model, X_test_w,  idx_test,  y_scaler)
+
+    print("\n=== Stage-1 Point Forecast Metrics (same model used later for MC) ===")
+    print("Train:", base_metrics(actual_train.values, pred_train_det.values))
+    print("Val:  ", base_metrics(actual_val.values,   pred_val_det.values))
+    print("Test: ", base_metrics(actual_test.values,  pred_test_det.values))
+
+    # ------------------ Load the SAME trained model for MC (Option A) ------------------
+    # NOTE: This step ensures we really use the saved weights.
+    same_model = tf.keras.models.load_model(CKPT_PATH, compile=False)
+    same_model.compile(optimizer=optimizers.Adam(learning_rate=best_params["lr"]), loss="mse")
+
+    print("\n[MC] Running Monte Carlo Dropout inference with same trained weights...")
+    mean_train, L_train, U_train, std_train, Ys_train = predict_mc(
+        same_model, X_train_w, idx_train, y_mean, y_scale, n_mc=N_MC, use_quantiles=USE_QUANTILES, alpha=ALPHA
+    )
+    mean_val,   L_val,   U_val,   std_val,   Ys_val   = predict_mc(
+        same_model, X_val_w,   idx_val,   y_mean, y_scale, n_mc=N_MC, use_quantiles=USE_QUANTILES, alpha=ALPHA
+    )
+    mean_test,  L_test,  U_test,  std_test,  Ys_test  = predict_mc(
+        same_model, X_test_w,  idx_test,  y_mean, y_scale, n_mc=N_MC, use_quantiles=USE_QUANTILES, alpha=ALPHA
+    )
+
+    # Stage-2 Point Forecast Metrics (after MC Dropout)
+    print(f"\n=== Stage-2 Point Forecast Metrics (MC Mean) ===")
+    print("Train:", base_metrics(actual_train.values, mean_train.values))
+    print("Val:  ", base_metrics(actual_val.values,   mean_val.values))
+    print("Test: ", base_metrics(actual_test.values,  mean_test.values))
+
+    print(f"\n=== Stage-2 UQ Metrics ({int((1-ALPHA)*100)}% PI) ===")
+    print("Train:", uq_metrics(actual_train.values, L_train.values, U_train.values, ALPHA))
+    print("Val:  ", uq_metrics(actual_val.values,   L_val.values,   U_val.values,   ALPHA))
+    print("Test: ", uq_metrics(actual_test.values,  L_test.values,  U_test.values,  ALPHA))
+
+    # ------------------ Epistemic vs Aleatoric (approximate split) ------------------
+    resid_val = actual_val.values - mean_val.values
+    sigma2_aleatoric = float(np.var(resid_val, ddof=1))
+    var_total_test   = np.var(Ys_test, axis=1, ddof=1)
+    var_epistemic    = np.maximum(0.0, var_total_test - sigma2_aleatoric)
+    var_aleatoric    = np.full_like(var_total_test, sigma2_aleatoric)
+
+    # Save core artifacts
+    best_json_path = os.path.join(RESULTS_DIR, "best_params.json")
+    with open(best_json_path, "w") as f:
+        json.dump(best_params, f, indent=2)
+    print(f"\nSaved best params to: {best_json_path}")
+    print(f"Saved trained model to: {CKPT_PATH}")
+
+    # ------------------ Visualizations ------------------
+    if DO_PLOTS:
+        plt.figure(figsize=(12,5))
+        plt.plot(df.index, df[TARGET_COL].values, label="Actual", linewidth=1)
+        plt.plot(mean_train.index, mean_train.values, label="Pred (Train, MC mean)", linewidth=1)
+        plt.plot(mean_val.index,   mean_val.values,   label="Pred (Val, MC mean)", linewidth=1)
+        plt.plot(mean_test.index,  mean_test.values,  label="Pred (Test, MC mean)", linewidth=1.5)
+        plt.fill_between(L_test.index, L_test.values, U_test.values, alpha=0.25, label=f"{int((1-ALPHA)*100)}% PI (Test)")
+        plt.title("All Actual vs Predicted — GRU (Optuna) + MC Dropout")
+        plt.xlabel("Date"); plt.ylabel(TARGET_COL); plt.legend(); plt.tight_layout(); plt.show()
+
+        # inside/outside markers
+        y_true = actual_test.values; L_arr = L_test.values; U_arr = U_test.values
+        inside = (y_true >= L_arr) & (y_true <= U_arr)
+        outside = ~inside
+
+        plt.figure(figsize=(12,5))
+        plt.plot(actual_test.index, actual_test.values, label="Actual (Test)", linewidth=1.5)
+        plt.plot(mean_test.index,   mean_test.values,   label="Pred (Test, MC mean)", linewidth=1.5)
+        plt.fill_between(L_test.index, L_test.values, U_test.values, alpha=0.30, label=f"{int((1-ALPHA)*100)}% PI")
+        plt.scatter(actual_test.index[inside],  actual_test.values[inside],  s=15, label="Inside PI", zorder=3, color="limegreen")
+        plt.scatter(actual_test.index[outside], actual_test.values[outside], s=25, marker="x", label="Outside PI", zorder=3, color="red")
+        plt.title("Test Horizon: Actual vs MC Mean with Prediction Interval (+ inside/outside)")
+        plt.xlabel("Date"); plt.ylabel(TARGET_COL); plt.legend(); plt.tight_layout(); plt.show()
+
+        # residuals
+        residuals_test = pd.Series(actual_test.values - mean_test.values, index=actual_test.index, name="Residuals")
+        plt.figure(figsize=(12,4))
+        plt.plot(residuals_test.index, residuals_test.values, linewidth=1)
+        plt.axhline(0, ls="--", lw=1); plt.title("Residuals Over Time (Test) — GRU + MC")
+        plt.xlabel("Date"); plt.ylabel("Actual - Pred"); plt.tight_layout(); plt.show()
+
+        # uncertainty decomposition
+        plt.figure(figsize=(12,5))
+        plt.plot(idx_test, var_epistemic, label="Epistemic Var (≈)", linewidth=1)
+        plt.plot(idx_test, var_aleatoric, label="Aleatoric Var (proxy)", linewidth=1)
+        plt.plot(idx_test, var_total_test, label="Total Predictive Var (MC)", linewidth=1.2)
+        plt.title("Uncertainty Decomposition Over Time (Test)")
+        plt.xlabel("Date"); plt.ylabel("Variance"); plt.legend(); plt.tight_layout(); plt.show()
+
+        # ===================== (a) Coverage heatmap (per-window) =====================
+        from matplotlib.colors import ListedColormap, BoundaryNorm
+        WINDOW_LEN = 30
+        STRIDE     = 10
+
+        y_true = actual_test.values
+        L_arr  = L_test.values
+        U_arr  = U_test.values
+        below_mask  = (y_true < L_arr)
+        above_mask  = (y_true > U_arr)
+        inside_mask = (y_true >= L_arr) & (y_true <= U_arr)
+
+        status = np.zeros_like(y_true, dtype=int)
+        status[below_mask] = -1
+        status[above_mask] =  1
+
+        starts = np.arange(0, len(status)-WINDOW_LEN+1, STRIDE)
+        if len(starts) == 0:
+            starts = np.array([0]); WINDOW_LEN = len(status)
+
+        mat = []
+        x_tick_labels = []
+        for s in starts:
+            e = min(s + WINDOW_LEN, len(status))
+            row = status[s:e]
+            if e - s < WINDOW_LEN:
+                row = np.pad(row, (0, WINDOW_LEN - (e - s)), constant_values=np.nan)
+            mat.append(row)
+            x_tick_labels.append(actual_test.index[s].strftime('%Y-%m-%d'))
+        mat = np.vstack(mat)
+
+        cmap   = ListedColormap(["#d62728", "#2ca02c", "#ff7f0e", "#bdbdbd"])  # red, green, orange, grey
+        bounds = [-1.5, -0.5, 0.5, 1.5, 2.5]
+        norm   = BoundaryNorm(bounds, cmap.N)
+
+        plt.figure(figsize=(12,6))
+        plt.imshow(mat, aspect="auto", interpolation="nearest", cmap=cmap, norm=norm)
+        plt.title(f"Coverage Heatmap (Test) — window={WINDOW_LEN}, stride={STRIDE}\n-1: Below | 0: Inside | +1: Above")
+        plt.xlabel("Position inside window"); plt.ylabel("Window start time")
+        yticks = np.arange(0, len(starts), max(1, len(starts)//10))
+        plt.yticks(yticks, [x_tick_labels[i] for i in yticks])
+        import matplotlib.patches as mpatches
+        legend_patches = [
+            mpatches.Patch(color="#2ca02c", label="Inside PI"),
+            mpatches.Patch(color="#d62728", label="Below lower"),
+            mpatches.Patch(color="#ff7f0e", label="Above upper"),
+            mpatches.Patch(color="#bdbdbd", label="Padding")
+        ]
+        plt.legend(handles=legend_patches, loc="upper right", frameon=True)
+        plt.tight_layout(); plt.show()
+
+        # ===================== Rolling PICP (calibration drift) =====================
+        ROLL_LEN = 30
+        y_true = actual_test.values; L_arr = L_test.values; U_arr = U_test.values
+        inside_series = pd.Series(((y_true >= L_arr) & (y_true <= U_arr)).astype(int), index=actual_test.index, name="inside")
+        rolling_picp = inside_series.rolling(window=ROLL_LEN, center=True, min_periods=max(3, ROLL_LEN//3)).mean()
+
+        plt.figure(figsize=(12,4))
+        plt.plot(rolling_picp.index, rolling_picp.values, linewidth=1.8, label=f"Rolling PICP (window={ROLL_LEN})")
+        plt.axhline(1 - ALPHA, ls="--", lw=1, label=f"Target coverage = {1-ALPHA:.2f}")
+        plt.ylim(0, 1.05)
+        plt.title("Rolling PICP on Test (Calibration over Time)")
+        plt.xlabel("Date"); plt.ylabel("Coverage")
+        plt.legend(); plt.tight_layout(); plt.show()
+
+        # ===================== Rolling MPIW (sharpness drift) =====================
+        width_series = pd.Series((U_arr - L_arr), index=actual_test.index, name="PI_width")
+        rolling_mpiw = width_series.rolling(window=ROLL_LEN, center=True, min_periods=max(3, ROLL_LEN//3)).mean()
+        overall_mpiw_test = width_series.mean()
+
+        plt.figure(figsize=(12,4))
+        plt.plot(rolling_mpiw.index, rolling_mpiw.values, linewidth=1.8, label=f"Rolling MPIW (window={ROLL_LEN})")
+        plt.axhline(overall_mpiw_test, ls="--", lw=1, label=f"Overall MPIW (Test) = {overall_mpiw_test:.2f}")
+        plt.title("Rolling MPIW on Test (Sharpness over Time)")
+        plt.xlabel("Date"); plt.ylabel("Interval Width")
+        plt.legend(); plt.tight_layout(); plt.show()
+
+        # ===================== Rolling PICP vs Normalized MPIW (combined) =====================
+        norm_mpiw = (rolling_mpiw - np.nanmin(rolling_mpiw)) / (np.nanmax(rolling_mpiw) - np.nanmin(rolling_mpiw) + 1e-12)
+        plt.figure(figsize=(12, 4))
+        plt.plot(rolling_picp.index, rolling_picp.values, linewidth=1.8, label="Rolling PICP (0–1)")
+        plt.plot(norm_mpiw.index, norm_mpiw.values, linewidth=1.5, label="Rolling MPIW (normalized 0–1)")
+        plt.axhline(1 - ALPHA, ls="--", lw=1, label=f"Target coverage = {1-ALPHA:.2f}")
+        plt.title("Rolling PICP vs Normalized Rolling MPIW (Test)")
+        plt.xlabel("Date"); plt.ylabel("Scaled value")
+        plt.legend(); plt.tight_layout(); plt.show()
+
+        # ===================== Stage-1 vs Stage-2 Metrics Comparison =====================
+        # Calculate Stage-1 metrics (deterministic)
+        stage1_train = base_metrics(actual_train.values, pred_train_det.values)
+        stage1_val   = base_metrics(actual_val.values,   pred_val_det.values)
+        stage1_test  = base_metrics(actual_test.values,  pred_test_det.values)
+
+        # Stage-2 metrics already computed (MC mean)
+        stage2_train = base_metrics(actual_train.values, mean_train.values)
+        stage2_val   = base_metrics(actual_val.values,   mean_val.values)
+        stage2_test  = base_metrics(actual_test.values,  mean_test.values)
+
+        # Prepare data for plotting
+        metrics_names = ["MAE", "MSE", "MAPE", "RMSE", "R2"]
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        axes = axes.flatten()
+
+        for idx, metric in enumerate(metrics_names):
+            ax = axes[idx]
+            stage1_vals = [stage1_train[metric], stage1_val[metric], stage1_test[metric]]
+            stage2_vals = [stage2_train[metric], stage2_val[metric], stage2_test[metric]]
+
+            x = np.arange(3)
+            width = 0.35
+
+            bars1 = ax.bar(x - width/2, stage1_vals, width, label="Stage-1 (Deterministic)", alpha=0.8, color="#1f77b4")
+            bars2 = ax.bar(x + width/2, stage2_vals, width, label="Stage-2 (MC Mean)", alpha=0.8, color="#ff7f0e")
+
+            ax.set_xlabel("Split")
+            ax.set_ylabel(metric)
+            ax.set_title(f"{metric} Comparison: Stage-1 vs Stage-2")
+            ax.set_xticks(x)
+            ax.set_xticklabels(["Train", "Val", "Test"])
+            ax.legend()
+            ax.grid(axis="y", alpha=0.3)
+
+            # Add value labels on bars
+            for bar in bars1:
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2., height,
+                       f'{height:.4f}', ha='center', va='bottom', fontsize=8)
+            for bar in bars2:
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2., height,
+                       f'{height:.4f}', ha='center', va='bottom', fontsize=8)
+
+        # Remove the extra subplot
+        fig.delaxes(axes[-1])
+
+        plt.tight_layout()
+        plt.show()
+
+        # Print summary table
+        print("\n=== Stage-1 vs Stage-2 Point Forecast Metrics Comparison ===")
+        comparison_data = []
+        for split, stage1, stage2 in [
+            ("Train", stage1_train, stage2_train),
+            ("Val", stage1_val, stage2_val),
+            ("Test", stage1_test, stage2_test),
+        ]:
+            for metric in metrics_names:
+                diff = stage2[metric] - stage1[metric]
+                pct_change = (diff / stage1[metric] * 100) if stage1[metric] != 0 else 0
+                comparison_data.append({
+                    "Split": split,
+                    "Metric": metric,
+                    "Stage-1": round(stage1[metric], 6),
+                    "Stage-2": round(stage2[metric], 6),
+                    "Difference": round(diff, 6),
+                    "% Change": round(pct_change, 2)
+                })
+
+        comparison_df = pd.DataFrame(comparison_data)
+        print(comparison_df.to_string(index=False))
+
+    print("\n[Done] Integrated pipeline finished successfully.")
+--------------------------------------------------------------------------------
+Cell 12
+Cell type: code
+-- Code --
+if __name__ == "__main__":
+    main()
+-- Outputs --
+[1] output_type: stream
+[I 2025-11-25 20:38:45,269] A new study created in memory with name: no-name-df047882-055f-405e-83c5-a13f14ae04ed
+[2] output_type: stream
+Seed: 42
+
+[Optuna] Starting study...
+[3] output_type: display_data
+  0%|          | 0/50 [00:00<?, ?it/s]
+[4] output_type: stream
+[I 2025-11-25 20:40:09,031] Trial 0 finished with value: 0.034986745566129684 and parameters: {'lookback': 45, 'batch_size': 32, 'epochs': 90, 'patience': 8, 'num_layers': 2, 'units1': 32, 'units2': 256, 'dropout': 0.41622132040021087, 'lr': 0.00022948683681130568}. Best is trial 0 with value: 0.034986745566129684.
+[I 2025-11-25 20:40:35,676] Trial 1 finished with value: 0.10560712963342667 and parameters: {'lookback': 90, 'batch_size': 128, 'epochs': 40, 'patience': 6, 'num_layers': 1, 'units1': 128, 'dropout': 0.3925879806965068, 'lr': 0.00021839352923182988}. Best is trial 0 with value: 0.034986745566129684.
+[I 2025-11-25 20:40:35,676] Trial 1 finished with value: 0.10560712963342667 and parameters: {'lookback': 90, 'batch_size': 128, 'epochs': 40, 'patience': 6, 'num_layers': 1, 'units1': 128, 'dropout': 0.3925879806965068, 'lr': 0.00021839352923182988}. Best is trial 0 with value: 0.034986745566129684.
+[I 2025-11-25 20:40:56,699] Trial 2 finished with value: 0.020130496472120285 and parameters: {'lookback': 90, 'batch_size': 128, 'epochs': 100, 'patience': 9, 'num_layers': 1, 'units1': 32, 'dropout': 0.34211651325607845, 'lr': 0.0005595074635794797}. Best is trial 2 with value: 0.020130496472120285.
+[I 2025-11-25 20:40:56,699] Trial 2 finished with value: 0.020130496472120285 and parameters: {'lookback': 90, 'batch_size': 128, 'epochs': 100, 'patience': 9, 'num_layers': 1, 'units1': 32, 'dropout': 0.34211651325607845, 'lr': 0.0005595074635794797}. Best is trial 2 with value: 0.020130496472120285.
+[I 2025-11-25 20:42:46,313] Trial 3 finished with value: 0.006898665335029364 and parameters: {'lookback': 90, 'batch_size': 64, 'epochs': 70, 'patience': 8, 'num_layers': 1, 'units1': 256, 'dropout': 0.3875664116805573, 'lr': 0.003946212980759096}. Best is trial 3 with value: 0.006898665335029364.
+[I 2025-11-25 20:42:46,313] Trial 3 finished with value: 0.006898665335029364 and parameters: {'lookback': 90, 'batch_size': 64, 'epochs': 70, 'patience': 8, 'num_layers': 1, 'units1': 256, 'dropout': 0.3875664116805573, 'lr': 0.003946212980759096}. Best is trial 3 with value: 0.006898665335029364.
+[I 2025-11-25 20:43:43,808] Trial 4 finished with value: 0.0213175006210804 and parameters: {'lookback': 60, 'batch_size': 128, 'epochs': 60, 'patience': 6, 'num_layers': 2, 'units1': 96, 'units2': 96, 'dropout': 0.27134804157912423, 'lr': 0.000173550564698551}. Best is trial 3 with value: 0.006898665335029364.
+[I 2025-11-25 20:43:43,808] Trial 4 finished with value: 0.0213175006210804 and parameters: {'lookback': 60, 'batch_size': 128, 'epochs': 60, 'patience': 6, 'num_layers': 2, 'units1': 96, 'units2': 96, 'dropout': 0.27134804157912423, 'lr': 0.000173550564698551}. Best is trial 3 with value: 0.006898665335029364.
+[I 2025-11-25 20:44:01,506] Trial 5 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 20:44:01,506] Trial 5 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 20:44:59,750] Trial 6 finished with value: 0.005515294149518013 and parameters: {'lookback': 30, 'batch_size': 64, 'epochs': 100, 'patience': 7, 'num_layers': 1, 'units1': 192, 'dropout': 0.3803925243084487, 'lr': 0.0008986552644007198}. Best is trial 6 with value: 0.005515294149518013.
+[I 2025-11-25 20:44:59,750] Trial 6 finished with value: 0.005515294149518013 and parameters: {'lookback': 30, 'batch_size': 64, 'epochs': 100, 'patience': 7, 'num_layers': 1, 'units1': 192, 'dropout': 0.3803925243084487, 'lr': 0.0008986552644007198}. Best is trial 6 with value: 0.005515294149518013.
+[I 2025-11-25 20:45:45,979] Trial 7 finished with value: 0.00736750615760684 and parameters: {'lookback': 30, 'batch_size': 64, 'epochs': 80, 'patience': 6, 'num_layers': 2, 'units1': 256, 'units2': 64, 'dropout': 0.20519146151781487, 'lr': 0.0019215811115723025}. Best is trial 6 with value: 0.005515294149518013.
+[I 2025-11-25 20:45:45,979] Trial 7 finished with value: 0.00736750615760684 and parameters: {'lookback': 30, 'batch_size': 64, 'epochs': 80, 'patience': 6, 'num_layers': 2, 'units1': 256, 'units2': 64, 'dropout': 0.20519146151781487, 'lr': 0.0019215811115723025}. Best is trial 6 with value: 0.005515294149518013.
+[I 2025-11-25 20:48:40,347] Trial 8 finished with value: 0.004388094879686832 and parameters: {'lookback': 60, 'batch_size': 32, 'epochs': 90, 'patience': 9, 'num_layers': 1, 'units1': 256, 'dropout': 0.26967112095782536, 'lr': 0.002354054991673985}. Best is trial 8 with value: 0.004388094879686832.
+[I 2025-11-25 20:48:40,347] Trial 8 finished with value: 0.004388094879686832 and parameters: {'lookback': 60, 'batch_size': 32, 'epochs': 90, 'patience': 9, 'num_layers': 1, 'units1': 256, 'dropout': 0.26967112095782536, 'lr': 0.002354054991673985}. Best is trial 8 with value: 0.004388094879686832.
+[I 2025-11-25 20:48:46,834] Trial 9 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 20:48:46,834] Trial 9 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 20:50:21,140] Trial 10 finished with value: 0.006455660797655582 and parameters: {'lookback': 60, 'batch_size': 32, 'epochs': 50, 'patience': 10, 'num_layers': 1, 'units1': 192, 'dropout': 0.17967289314422225, 'lr': 0.0013423567543180308}. Best is trial 8 with value: 0.004388094879686832.
+[I 2025-11-25 20:50:21,140] Trial 10 finished with value: 0.006455660797655582 and parameters: {'lookback': 60, 'batch_size': 32, 'epochs': 50, 'patience': 10, 'num_layers': 1, 'units1': 192, 'dropout': 0.17967289314422225, 'lr': 0.0013423567543180308}. Best is trial 8 with value: 0.004388094879686832.
+[I 2025-11-25 20:50:42,623] Trial 11 pruned. Trial was pruned at epoch 7.
+[I 2025-11-25 20:50:42,623] Trial 11 pruned. Trial was pruned at epoch 7.
+[I 2025-11-25 20:51:31,429] Trial 12 finished with value: 0.005401556845754385 and parameters: {'lookback': 45, 'batch_size': 32, 'epochs': 90, 'patience': 5, 'num_layers': 1, 'units1': 192, 'dropout': 0.29938408639561614, 'lr': 0.0006962405447088134}. Best is trial 8 with value: 0.004388094879686832.
+[I 2025-11-25 20:51:31,429] Trial 12 finished with value: 0.005401556845754385 and parameters: {'lookback': 45, 'batch_size': 32, 'epochs': 90, 'patience': 5, 'num_layers': 1, 'units1': 192, 'dropout': 0.29938408639561614, 'lr': 0.0006962405447088134}. Best is trial 8 with value: 0.004388094879686832.
+[I 2025-11-25 20:52:53,191] Trial 13 finished with value: 0.006628844421356916 and parameters: {'lookback': 45, 'batch_size': 32, 'epochs': 80, 'patience': 5, 'num_layers': 1, 'units1': 224, 'dropout': 0.2802567568358696, 'lr': 0.0005109076476976978}. Best is trial 8 with value: 0.004388094879686832.
+[I 2025-11-25 20:52:53,191] Trial 13 finished with value: 0.006628844421356916 and parameters: {'lookback': 45, 'batch_size': 32, 'epochs': 80, 'patience': 5, 'num_layers': 1, 'units1': 224, 'dropout': 0.2802567568358696, 'lr': 0.0005109076476976978}. Best is trial 8 with value: 0.004388094879686832.
+[I 2025-11-25 20:54:06,133] Trial 14 finished with value: 0.005172954872250557 and parameters: {'lookback': 45, 'batch_size': 32, 'epochs': 90, 'patience': 10, 'num_layers': 1, 'units1': 160, 'dropout': 0.172602674006116, 'lr': 0.0019471876788133317}. Best is trial 8 with value: 0.004388094879686832.
+[I 2025-11-25 20:54:06,133] Trial 14 finished with value: 0.005172954872250557 and parameters: {'lookback': 45, 'batch_size': 32, 'epochs': 90, 'patience': 10, 'num_layers': 1, 'units1': 160, 'dropout': 0.172602674006116, 'lr': 0.0019471876788133317}. Best is trial 8 with value: 0.004388094879686832.
+[I 2025-11-25 20:55:39,995] Trial 15 finished with value: 0.004840916022658348 and parameters: {'lookback': 45, 'batch_size': 32, 'epochs': 70, 'patience': 10, 'num_layers': 1, 'units1': 128, 'dropout': 0.11285418148585791, 'lr': 0.0022391265405546754}. Best is trial 8 with value: 0.004388094879686832.
+[I 2025-11-25 20:55:39,995] Trial 15 finished with value: 0.004840916022658348 and parameters: {'lookback': 45, 'batch_size': 32, 'epochs': 70, 'patience': 10, 'num_layers': 1, 'units1': 128, 'dropout': 0.11285418148585791, 'lr': 0.0022391265405546754}. Best is trial 8 with value: 0.004388094879686832.
+[I 2025-11-25 20:57:05,327] Trial 16 finished with value: 0.0038878577761352062 and parameters: {'lookback': 60, 'batch_size': 32, 'epochs': 60, 'patience': 9, 'num_layers': 1, 'units1': 128, 'dropout': 0.11712976602954392, 'lr': 0.003865078322400832}. Best is trial 16 with value: 0.0038878577761352062.
+[I 2025-11-25 20:57:05,327] Trial 16 finished with value: 0.0038878577761352062 and parameters: {'lookback': 60, 'batch_size': 32, 'epochs': 60, 'patience': 9, 'num_layers': 1, 'units1': 128, 'dropout': 0.11712976602954392, 'lr': 0.003865078322400832}. Best is trial 16 with value: 0.0038878577761352062.
+[I 2025-11-25 20:58:22,132] Trial 17 pruned. Trial was pruned at epoch 7.
+[I 2025-11-25 20:58:22,132] Trial 17 pruned. Trial was pruned at epoch 7.
+[I 2025-11-25 20:58:59,644] Trial 18 pruned. Trial was pruned at epoch 7.
+[I 2025-11-25 20:58:59,644] Trial 18 pruned. Trial was pruned at epoch 7.
+[I 2025-11-25 21:00:03,938] Trial 19 pruned. Trial was pruned at epoch 19.
+[I 2025-11-25 21:00:03,938] Trial 19 pruned. Trial was pruned at epoch 19.
+[I 2025-11-25 21:01:19,422] Trial 20 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 21:01:19,422] Trial 20 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 21:02:17,654] Trial 21 pruned. Trial was pruned at epoch 19.
+[I 2025-11-25 21:02:17,654] Trial 21 pruned. Trial was pruned at epoch 19.
+[I 2025-11-25 21:03:53,432] Trial 22 finished with value: 0.004728158004581928 and parameters: {'lookback': 60, 'batch_size': 32, 'epochs': 60, 'patience': 10, 'num_layers': 1, 'units1': 128, 'dropout': 0.10028844662724203, 'lr': 0.0036142986541010014}. Best is trial 16 with value: 0.0038878577761352062.
+[I 2025-11-25 21:03:53,432] Trial 22 finished with value: 0.004728158004581928 and parameters: {'lookback': 60, 'batch_size': 32, 'epochs': 60, 'patience': 10, 'num_layers': 1, 'units1': 128, 'dropout': 0.10028844662724203, 'lr': 0.0036142986541010014}. Best is trial 16 with value: 0.0038878577761352062.
+[I 2025-11-25 21:05:15,514] Trial 23 finished with value: 0.004095363896340132 and parameters: {'lookback': 60, 'batch_size': 32, 'epochs': 60, 'patience': 9, 'num_layers': 1, 'units1': 160, 'dropout': 0.08105101714349056, 'lr': 0.004837813341107461}. Best is trial 16 with value: 0.0038878577761352062.
+[I 2025-11-25 21:05:15,514] Trial 23 finished with value: 0.004095363896340132 and parameters: {'lookback': 60, 'batch_size': 32, 'epochs': 60, 'patience': 9, 'num_layers': 1, 'units1': 160, 'dropout': 0.08105101714349056, 'lr': 0.004837813341107461}. Best is trial 16 with value: 0.0038878577761352062.
+[I 2025-11-25 21:06:39,750] Trial 24 finished with value: 0.008384918794035912 and parameters: {'lookback': 60, 'batch_size': 32, 'epochs': 40, 'patience': 8, 'num_layers': 1, 'units1': 224, 'dropout': 0.009156099045255828, 'lr': 0.0045015218029049705}. Best is trial 16 with value: 0.0038878577761352062.
+[I 2025-11-25 21:06:39,750] Trial 24 finished with value: 0.008384918794035912 and parameters: {'lookback': 60, 'batch_size': 32, 'epochs': 40, 'patience': 8, 'num_layers': 1, 'units1': 224, 'dropout': 0.009156099045255828, 'lr': 0.0045015218029049705}. Best is trial 16 with value: 0.0038878577761352062.
+[I 2025-11-25 21:07:17,659] Trial 25 pruned. Trial was pruned at epoch 7.
+[I 2025-11-25 21:07:17,659] Trial 25 pruned. Trial was pruned at epoch 7.
+[I 2025-11-25 21:07:36,911] Trial 26 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 21:07:36,911] Trial 26 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 21:10:04,927] Trial 27 finished with value: 0.00480215298011899 and parameters: {'lookback': 60, 'batch_size': 32, 'epochs': 50, 'patience': 9, 'num_layers': 1, 'units1': 256, 'dropout': 0.31400233122608706, 'lr': 0.0014115972726103678}. Best is trial 16 with value: 0.0038878577761352062.
+[I 2025-11-25 21:10:04,927] Trial 27 finished with value: 0.00480215298011899 and parameters: {'lookback': 60, 'batch_size': 32, 'epochs': 50, 'patience': 9, 'num_layers': 1, 'units1': 256, 'dropout': 0.31400233122608706, 'lr': 0.0014115972726103678}. Best is trial 16 with value: 0.0038878577761352062.
+[I 2025-11-25 21:10:18,388] Trial 28 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 21:10:18,388] Trial 28 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 21:11:30,371] Trial 29 pruned. Trial was pruned at epoch 7.
+[I 2025-11-25 21:11:30,371] Trial 29 pruned. Trial was pruned at epoch 7.
+[I 2025-11-25 21:16:15,167] Trial 30 finished with value: 0.003256013384088874 and parameters: {'lookback': 90, 'batch_size': 32, 'epochs': 60, 'patience': 9, 'num_layers': 1, 'units1': 224, 'dropout': 0.04311815333001495, 'lr': 0.003646365785486806}. Best is trial 30 with value: 0.003256013384088874.
+[I 2025-11-25 21:16:15,167] Trial 30 finished with value: 0.003256013384088874 and parameters: {'lookback': 90, 'batch_size': 32, 'epochs': 60, 'patience': 9, 'num_layers': 1, 'units1': 224, 'dropout': 0.04311815333001495, 'lr': 0.003646365785486806}. Best is trial 30 with value: 0.003256013384088874.
+[I 2025-11-25 21:20:23,558] Trial 31 finished with value: 0.0033592237159609795 and parameters: {'lookback': 90, 'batch_size': 32, 'epochs': 60, 'patience': 9, 'num_layers': 1, 'units1': 224, 'dropout': 0.049049524174436664, 'lr': 0.0034420383488710715}. Best is trial 30 with value: 0.003256013384088874.
+[I 2025-11-25 21:20:23,558] Trial 31 finished with value: 0.0033592237159609795 and parameters: {'lookback': 90, 'batch_size': 32, 'epochs': 60, 'patience': 9, 'num_layers': 1, 'units1': 224, 'dropout': 0.049049524174436664, 'lr': 0.0034420383488710715}. Best is trial 30 with value: 0.003256013384088874.
+[I 2025-11-25 21:23:51,132] Trial 32 finished with value: 0.0036385864950716496 and parameters: {'lookback': 90, 'batch_size': 32, 'epochs': 60, 'patience': 8, 'num_layers': 1, 'units1': 224, 'dropout': 0.03658869713984801, 'lr': 0.0035531536315205592}. Best is trial 30 with value: 0.003256013384088874.
+[I 2025-11-25 21:23:51,132] Trial 32 finished with value: 0.0036385864950716496 and parameters: {'lookback': 90, 'batch_size': 32, 'epochs': 60, 'patience': 8, 'num_layers': 1, 'units1': 224, 'dropout': 0.03658869713984801, 'lr': 0.0035531536315205592}. Best is trial 30 with value: 0.003256013384088874.
+[I 2025-11-25 21:26:50,218] Trial 33 finished with value: 0.004508413374423981 and parameters: {'lookback': 90, 'batch_size': 32, 'epochs': 50, 'patience': 8, 'num_layers': 1, 'units1': 224, 'dropout': 0.03645231479240297, 'lr': 0.0034776663322400874}. Best is trial 30 with value: 0.003256013384088874.
+[I 2025-11-25 21:26:50,218] Trial 33 finished with value: 0.004508413374423981 and parameters: {'lookback': 90, 'batch_size': 32, 'epochs': 50, 'patience': 8, 'num_layers': 1, 'units1': 224, 'dropout': 0.03645231479240297, 'lr': 0.0034776663322400874}. Best is trial 30 with value: 0.003256013384088874.
+[I 2025-11-25 21:29:33,531] Trial 34 finished with value: 0.0037449144292622805 and parameters: {'lookback': 90, 'batch_size': 128, 'epochs': 60, 'patience': 8, 'num_layers': 1, 'units1': 224, 'dropout': 0.043453484489717205, 'lr': 0.00378814553963246}. Best is trial 30 with value: 0.003256013384088874.
+[I 2025-11-25 21:29:33,531] Trial 34 finished with value: 0.0037449144292622805 and parameters: {'lookback': 90, 'batch_size': 128, 'epochs': 60, 'patience': 8, 'num_layers': 1, 'units1': 224, 'dropout': 0.043453484489717205, 'lr': 0.00378814553963246}. Best is trial 30 with value: 0.003256013384088874.
+[I 2025-11-25 21:31:49,102] Trial 35 finished with value: 0.0038576701190322638 and parameters: {'lookback': 90, 'batch_size': 128, 'epochs': 70, 'patience': 7, 'num_layers': 1, 'units1': 224, 'dropout': 0.03949162433764396, 'lr': 0.003501237635555382}. Best is trial 30 with value: 0.003256013384088874.
+[I 2025-11-25 21:31:49,102] Trial 35 finished with value: 0.0038576701190322638 and parameters: {'lookback': 90, 'batch_size': 128, 'epochs': 70, 'patience': 7, 'num_layers': 1, 'units1': 224, 'dropout': 0.03949162433764396, 'lr': 0.003501237635555382}. Best is trial 30 with value: 0.003256013384088874.
+[I 2025-11-25 21:32:23,545] Trial 36 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 21:32:23,545] Trial 36 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 21:33:45,689] Trial 37 pruned. Trial was pruned at epoch 19.
+[I 2025-11-25 21:33:45,689] Trial 37 pruned. Trial was pruned at epoch 19.
+[I 2025-11-25 21:35:11,916] Trial 38 pruned. Trial was pruned at epoch 22.
+[I 2025-11-25 21:35:11,916] Trial 38 pruned. Trial was pruned at epoch 22.
+[I 2025-11-25 21:39:07,654] Trial 39 finished with value: 0.003721787827089429 and parameters: {'lookback': 90, 'batch_size': 128, 'epochs': 70, 'patience': 8, 'num_layers': 2, 'units1': 224, 'units2': 32, 'dropout': 0.002731992092071499, 'lr': 0.0009781471654241587}. Best is trial 30 with value: 0.003256013384088874.
+[I 2025-11-25 21:39:07,654] Trial 39 finished with value: 0.003721787827089429 and parameters: {'lookback': 90, 'batch_size': 128, 'epochs': 70, 'patience': 8, 'num_layers': 2, 'units1': 224, 'units2': 32, 'dropout': 0.002731992092071499, 'lr': 0.0009781471654241587}. Best is trial 30 with value: 0.003256013384088874.
+[I 2025-11-25 21:39:55,706] Trial 40 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 21:39:55,706] Trial 40 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 21:41:41,970] Trial 41 pruned. Trial was pruned at epoch 16.
+[I 2025-11-25 21:41:41,970] Trial 41 pruned. Trial was pruned at epoch 16.
+[I 2025-11-25 21:45:39,191] Trial 42 pruned. Trial was pruned at epoch 22.
+[I 2025-11-25 21:45:39,191] Trial 42 pruned. Trial was pruned at epoch 22.
+[I 2025-11-25 21:50:04,659] Trial 43 pruned. Trial was pruned at epoch 19.
+[I 2025-11-25 21:50:04,659] Trial 43 pruned. Trial was pruned at epoch 19.
+[I 2025-11-25 21:53:47,887] Trial 44 pruned. Trial was pruned at epoch 14.
+[I 2025-11-25 21:53:47,887] Trial 44 pruned. Trial was pruned at epoch 14.
+[I 2025-11-25 21:54:17,367] Trial 45 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 21:54:17,367] Trial 45 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 21:54:52,182] Trial 46 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 21:54:52,182] Trial 46 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 21:59:06,147] Trial 47 finished with value: 0.0037309869658201933 and parameters: {'lookback': 90, 'batch_size': 64, 'epochs': 80, 'patience': 7, 'num_layers': 1, 'units1': 224, 'dropout': 0.05608987130438469, 'lr': 0.002038192288474857}. Best is trial 30 with value: 0.003256013384088874.
+[I 2025-11-25 21:59:06,147] Trial 47 finished with value: 0.0037309869658201933 and parameters: {'lookback': 90, 'batch_size': 64, 'epochs': 80, 'patience': 7, 'num_layers': 1, 'units1': 224, 'dropout': 0.05608987130438469, 'lr': 0.002038192288474857}. Best is trial 30 with value: 0.003256013384088874.
+[I 2025-11-25 22:00:14,556] Trial 48 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 22:00:14,556] Trial 48 pruned. Trial was pruned at epoch 5.
+[I 2025-11-25 22:01:34,092] Trial 49 finished with value: 0.00419201422482729 and parameters: {'lookback': 30, 'batch_size': 64, 'epochs': 30, 'patience': 6, 'num_layers': 1, 'units1': 256, 'dropout': 0.09967349495470881, 'lr': 0.0014974126437727786}. Best is trial 30 with value: 0.003256013384088874.
+[Optuna] Best params: {'lookback': 90, 'batch_size': 32, 'epochs': 60, 'patience': 9, 'num_layers': 1, 'units1': 224, 'dropout': 0.04311815333001495, 'lr': 0.003646365785486806}
+
+[Train] Retraining final GRU with best params...
+[I 2025-11-25 22:01:34,092] Trial 49 finished with value: 0.00419201422482729 and parameters: {'lookback': 30, 'batch_size': 64, 'epochs': 30, 'patience': 6, 'num_layers': 1, 'units1': 256, 'dropout': 0.09967349495470881, 'lr': 0.0014974126437727786}. Best is trial 30 with value: 0.003256013384088874.
+[Optuna] Best params: {'lookback': 90, 'batch_size': 32, 'epochs': 60, 'patience': 9, 'num_layers': 1, 'units1': 224, 'dropout': 0.04311815333001495, 'lr': 0.003646365785486806}
+
+[Train] Retraining final GRU with best params...
+Epoch 1/60
+Epoch 1/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m16s[0m 165ms/step - loss: 0.2171 - val_loss: 0.0121
+Epoch 2/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m16s[0m 165ms/step - loss: 0.2171 - val_loss: 0.0121
+Epoch 2/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m13s[0m 158ms/step - loss: 0.0098 - val_loss: 0.0132
+Epoch 3/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m13s[0m 158ms/step - loss: 0.0098 - val_loss: 0.0132
+Epoch 3/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m13s[0m 160ms/step - loss: 0.0093 - val_loss: 0.0121
+Epoch 4/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m13s[0m 160ms/step - loss: 0.0093 - val_loss: 0.0121
+Epoch 4/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m13s[0m 157ms/step - loss: 0.0087 - val_loss: 0.0085
+Epoch 5/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m13s[0m 157ms/step - loss: 0.0087 - val_loss: 0.0085
+Epoch 5/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m13s[0m 157ms/step - loss: 0.0080 - val_loss: 0.0057
+Epoch 6/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m13s[0m 157ms/step - loss: 0.0080 - val_loss: 0.0057
+Epoch 6/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m13s[0m 158ms/step - loss: 0.0072 - val_loss: 0.0079
+Epoch 7/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m13s[0m 158ms/step - loss: 0.0072 - val_loss: 0.0079
+Epoch 7/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m13s[0m 158ms/step - loss: 0.0067 - val_loss: 0.0076
+Epoch 8/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m13s[0m 158ms/step - loss: 0.0067 - val_loss: 0.0076
+Epoch 8/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 155ms/step - loss: 0.0060 - val_loss: 0.0087
+Epoch 9/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 155ms/step - loss: 0.0060 - val_loss: 0.0087
+Epoch 9/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 155ms/step - loss: 0.0058 - val_loss: 0.0098
+Epoch 10/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 155ms/step - loss: 0.0058 - val_loss: 0.0098
+Epoch 10/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m13s[0m 157ms/step - loss: 0.0059 - val_loss: 0.0076
+Epoch 11/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m13s[0m 157ms/step - loss: 0.0059 - val_loss: 0.0076
+Epoch 11/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m13s[0m 160ms/step - loss: 0.0059 - val_loss: 0.0096
+Epoch 12/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m13s[0m 160ms/step - loss: 0.0059 - val_loss: 0.0096
+Epoch 12/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m13s[0m 157ms/step - loss: 0.0061 - val_loss: 0.0040
+Epoch 13/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m13s[0m 157ms/step - loss: 0.0061 - val_loss: 0.0040
+Epoch 13/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 151ms/step - loss: 0.0053 - val_loss: 0.0133
+Epoch 14/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 151ms/step - loss: 0.0053 - val_loss: 0.0133
+Epoch 14/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 156ms/step - loss: 0.0053 - val_loss: 0.0069
+Epoch 15/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 156ms/step - loss: 0.0053 - val_loss: 0.0069
+Epoch 15/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 153ms/step - loss: 0.0055 - val_loss: 0.0050
+Epoch 16/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 153ms/step - loss: 0.0055 - val_loss: 0.0050
+Epoch 16/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0050 - val_loss: 0.0136
+Epoch 17/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0050 - val_loss: 0.0136
+Epoch 17/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0052 - val_loss: 0.0070
+Epoch 18/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0052 - val_loss: 0.0070
+Epoch 18/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 153ms/step - loss: 0.0049 - val_loss: 0.0038
+Epoch 19/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 153ms/step - loss: 0.0049 - val_loss: 0.0038
+Epoch 19/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0046 - val_loss: 0.0051
+Epoch 20/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0046 - val_loss: 0.0051
+Epoch 20/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0051 - val_loss: 0.0052
+Epoch 21/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0051 - val_loss: 0.0052
+Epoch 21/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0047 - val_loss: 0.0043
+Epoch 22/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0047 - val_loss: 0.0043
+Epoch 22/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0045 - val_loss: 0.0064
+Epoch 23/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0045 - val_loss: 0.0064
+Epoch 23/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 153ms/step - loss: 0.0048 - val_loss: 0.0045
+Epoch 24/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 153ms/step - loss: 0.0048 - val_loss: 0.0045
+Epoch 24/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0044 - val_loss: 0.0056
+Epoch 25/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0044 - val_loss: 0.0056
+Epoch 25/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0046 - val_loss: 0.0058
+Epoch 26/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0046 - val_loss: 0.0058
+Epoch 26/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0046 - val_loss: 0.0073
+Epoch 27/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0046 - val_loss: 0.0073
+Epoch 27/60
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0049 - val_loss: 0.0057
+[1m80/80[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m12s[0m 152ms/step - loss: 0.0049 - val_loss: 0.0057
+[Train] Done in 338.96s
+[Train] Done in 338.96s
+
+=== Stage-1 Point Forecast Metrics (same model used later for MC) ===
+Train: {'MSE': 1916.3930923177506, 'MAE': 31.093048797876932, 'RMSE': 43.77662723780523, 'MAPE': 0.005533238681953792, 'R2': 0.9961467001986094}
+Val:   {'MSE': 1887.058368585676, 'MAE': 31.501104657023525, 'RMSE': 43.44028508867864, 'MAPE': 0.004606314132727268, 'R2': 0.8757071493635893}
+Test:  {'MSE': 14965.856698768883, 'MAE': 102.24748001386718, 'RMSE': 122.33501828490844, 'MAPE': 0.01416272789332106, 'R2': 0.865479460207293}
+
+[MC] Running Monte Carlo Dropout inference with same trained weights...
+
+=== Stage-1 Point Forecast Metrics (same model used later for MC) ===
+Train: {'MSE': 1916.3930923177506, 'MAE': 31.093048797876932, 'RMSE': 43.77662723780523, 'MAPE': 0.005533238681953792, 'R2': 0.9961467001986094}
+Val:   {'MSE': 1887.058368585676, 'MAE': 31.501104657023525, 'RMSE': 43.44028508867864, 'MAPE': 0.004606314132727268, 'R2': 0.8757071493635893}
+Test:  {'MSE': 14965.856698768883, 'MAE': 102.24748001386718, 'RMSE': 122.33501828490844, 'MAPE': 0.01416272789332106, 'R2': 0.865479460207293}
+
+[MC] Running Monte Carlo Dropout inference with same trained weights...
+
+=== Stage-2 Point Forecast Metrics (MC Mean) ===
+Train: {'MSE': 1915.3314796826608, 'MAE': 31.125064448053955, 'RMSE': 43.76450022201397, 'MAPE': 0.0055397838024984335, 'R2': 0.9961488347876832}
+Val:   {'MSE': 1866.955721596069, 'MAE': 31.297044185643585, 'RMSE': 43.208283020690246, 'MAPE': 0.004576937477739245, 'R2': 0.8770312288628093}
+Test:  {'MSE': 14946.814214571548, 'MAE': 102.10498809916992, 'RMSE': 122.25716426685001, 'MAPE': 0.014142793110165952, 'R2': 0.8656506234961565}
+
+=== Stage-2 UQ Metrics (90% PI) ===
+Train: {'PICP': 0.5035405192761605, 'MPIW': 49.48705103384237, 'Winkler': 328.1655067784271}
+Val:   {'PICP': 0.7574257425742574, 'MPIW': 93.37865594542858, 'Winkler': 227.74937499941976}
+Test:  {'PICP': 0.2765625, 'MPIW': 128.50309738159177, 'Winkler': 1137.0198873715817}
+
+Saved best params to: Results\best_params.json
+Saved trained model to: Model Checkpoints\gru_optuna_best.keras
+
+=== Stage-2 Point Forecast Metrics (MC Mean) ===
+Train: {'MSE': 1915.3314796826608, 'MAE': 31.125064448053955, 'RMSE': 43.76450022201397, 'MAPE': 0.0055397838024984335, 'R2': 0.9961488347876832}
+Val:   {'MSE': 1866.955721596069, 'MAE': 31.297044185643585, 'RMSE': 43.208283020690246, 'MAPE': 0.004576937477739245, 'R2': 0.8770312288628093}
+Test:  {'MSE': 14946.814214571548, 'MAE': 102.10498809916992, 'RMSE': 122.25716426685001, 'MAPE': 0.014142793110165952, 'R2': 0.8656506234961565}
+
+=== Stage-2 UQ Metrics (90% PI) ===
+Train: {'PICP': 0.5035405192761605, 'MPIW': 49.48705103384237, 'Winkler': 328.1655067784271}
+Val:   {'PICP': 0.7574257425742574, 'MPIW': 93.37865594542858, 'Winkler': 227.74937499941976}
+Test:  {'PICP': 0.2765625, 'MPIW': 128.50309738159177, 'Winkler': 1137.0198873715817}
+
+Saved best params to: Results\best_params.json
+Saved trained model to: Model Checkpoints\gru_optuna_best.keras
+[5] output_type: display_data
+<Figure size 1200x500 with 1 Axes>
+[6] output_type: display_data
+<Figure size 1200x500 with 1 Axes>
+[7] output_type: display_data
+<Figure size 1200x400 with 1 Axes>
+[8] output_type: display_data
+<Figure size 1200x500 with 1 Axes>
+[9] output_type: display_data
+<Figure size 1200x600 with 1 Axes>
+[10] output_type: display_data
+<Figure size 1200x400 with 1 Axes>
+[11] output_type: display_data
+<Figure size 1200x400 with 1 Axes>
+[12] output_type: display_data
+<Figure size 1200x400 with 1 Axes>
+[13] output_type: display_data
+<Figure size 1500x1000 with 5 Axes>
+[14] output_type: stream
+
+=== Stage-1 vs Stage-2 Point Forecast Metrics Comparison ===
+Split Metric      Stage-1      Stage-2  Difference  % Change
+Train    MAE    31.093049    31.125064    0.032016      0.10
+Train    MSE  1916.393092  1915.331480   -1.061613     -0.06
+Train   MAPE     0.005533     0.005540    0.000007      0.12
+Train   RMSE    43.776627    43.764500   -0.012127     -0.03
+Train     R2     0.996147     0.996149    0.000002      0.00
+  Val    MAE    31.501105    31.297044   -0.204060     -0.65
+  Val    MSE  1887.058369  1866.955722  -20.102647     -1.07
+  Val   MAPE     0.004606     0.004577   -0.000029     -0.64
+  Val   RMSE    43.440285    43.208283   -0.232002     -0.53
+  Val     R2     0.875707     0.877031    0.001324      0.15
+ Test    MAE   102.247480   102.104988   -0.142492     -0.14
+ Test    MSE 14965.856699 14946.814215  -19.042484     -0.13
+ Test   MAPE     0.014163     0.014143   -0.000020     -0.14
+ Test   RMSE   122.335018   122.257164   -0.077854     -0.06
+ Test     R2     0.865479     0.865651    0.000171      0.02
+
+[Done] Integrated pipeline finished successfully.
+--------------------------------------------------------------------------------
+Cell 13
+Cell type: code
+-- Code --
+
+--------------------------------------------------------------------------------

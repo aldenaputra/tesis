@@ -1,0 +1,883 @@
+Notebook: TCN_MCD_42.ipynb
+Kernelspec: {'display_name': 'tesis_env', 'language': 'python', 'name': 'python3'}
+
+--------------------------------------------------------------------------------
+Cell 1
+Cell type: code
+-- Code --
+!pip install -q optuna optuna-integration[tfkeras]
+-- Outputs --
+[1] output_type: stream
+
+[notice] A new release of pip is available: 23.1.2 -> 25.3
+[notice] To update, run: python.exe -m pip install --upgrade pip
+--------------------------------------------------------------------------------
+Cell 2
+Cell type: code
+-- Code --
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import optuna
+import random
+import os
+
+from datetime import datetime
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, mean_absolute_percentage_error
+
+import tensorflow as tf
+from tensorflow.keras import Model, Input, optimizers
+from tensorflow.keras.layers import Conv1D, Dense, Dropout, SpatialDropout1D, LayerNormalization, Activation, Add, Lambda
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from optuna.integration import TFKerasPruningCallback
+--------------------------------------------------------------------------------
+Cell 3
+Cell type: code
+-- Code --
+CSV_PATH   = "ALL_MERGED.csv"   # <--- set your CSV path
+DATE_COL   = "Date"
+TARGET_COL = "JKSE"
+INCLUDE_TARGET_AS_FEATURE = True  # set False to exclude JKSE from X
+
+TEST_SIZE  = 0.20
+VAL_SIZE   = 0.10
+
+N_TRIALS   = 50
+RANDOM_SEED = 42
+
+print(RANDOM_SEED)
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
+os.environ["PYTHONHASHSEED"] = str(RANDOM_SEED)
+
+# UQ CONFIG
+N_MC  = 100       # number of MC passes
+ALPHA = 0.05      # 95% PI
+USE_QUANTILES = True  # if False: Gaussian z*std
+
+ROLL_LEN    = 30
+HEAT_WIN    = 30
+HEAT_STRIDE = 10
+-- Outputs --
+[1] output_type: stream
+42
+--------------------------------------------------------------------------------
+Cell 4
+Cell type: code
+-- Code --
+df = pd.read_csv(CSV_PATH)
+required = [
+    "Date","Nickel_Fut","Coal_Fut_Newcastle","Palm_Oil_Fut",
+    "USD_IDR","CNY_IDR","EUR_IDR","BTC_USD",
+    "FTSE100","HANGSENG","NIKKEI225","SNP500","DOW30","SSE_Composite","JKSE"
+]
+missing = [c for c in required if c not in df.columns]
+if missing:
+    raise ValueError(f"Missing columns: {missing}")
+
+df[DATE_COL] = pd.to_datetime(df[DATE_COL])
+df = df.sort_values(DATE_COL).set_index(DATE_COL)
+df = df.ffill().bfill()
+df
+-- Outputs --
+[1] output_type: execute_result
+            Nickel_Fut  Coal_Fut_Newcastle  Palm_Oil_Fut  USD_IDR  CNY_IDR  \
+Date                                                                         
+2015-05-01    13750.00               62.20          2136  12962.5  2089.78   
+2015-05-02    13750.00               62.20          2136  12962.5  2089.78   
+2015-05-03    13750.00               62.20          2136  12962.5  2089.78   
+2015-05-04    13750.00               62.20          2136  12980.0  2090.51   
+2015-05-05    14245.00               62.50          2136  13047.5  2102.39   
+...                ...                 ...           ...      ...      ...   
+2025-04-27    15482.88               93.75          4057  16830.0  2309.37   
+2025-04-28    15637.63               95.60          3943  16855.0  2310.59   
+2025-04-29    15564.00               97.25          3911  16760.0  2305.52   
+2025-04-30    15342.50               97.50          3911  16600.0  2282.94   
+2025-05-01    15218.63               97.50          3881  16600.0  2282.94   
+
+            EUR_IDR       BTC_USD      FTSE100     HANGSENG    NIKKEI225  \
+Date                                                                       
+2015-05-01  14519.9    232.078995  6986.000000  28123.82031  19531.63086   
+2015-05-02  14519.9    234.929993  6986.000000  28123.82031  19531.63086   
+2015-05-03  14519.9    240.358002  6986.000000  28123.82031  19531.63086   
+2015-05-04  14467.5    239.018005  6986.000000  28123.82031  19531.63086   
+2015-05-05  14594.9    236.121002  6927.600098  27755.53906  19531.63086   
+...             ...           ...          ...          ...          ...   
+2025-04-27  19127.3  93754.843750  8415.299805  21980.74023  35705.73828   
+2025-04-28  19251.8  94978.750000  8417.299805  21971.96094  35839.98828   
+2025-04-29  19082.1  94284.789060  8463.500000  22008.10938  35839.98828   
+2025-04-30  18805.3  94207.312500  8494.900391  22119.41016  36045.37891   
+2025-05-01  18745.6  96492.335940  8496.799805  22119.41016  36452.30078   
+
+                 SNP500        DOW30  SSE_Composite         JKSE  
+Date                                                              
+2015-05-01  2108.290039  18024.06055    4480.463867  5140.937012  
+2015-05-02  2108.290039  18024.06055    4480.463867  5140.937012  
+2015-05-03  2108.290039  18024.06055    4480.463867  5140.937012  
+2015-05-04  2114.489990  18070.40039    4480.463867  5140.937012  
+2015-05-05  2089.459961  17928.19922    4298.706055  5160.107422  
+...                 ...          ...            ...          ...  
+2025-04-27  5525.209961  40113.50000    3295.060059  6678.915039  
+2025-04-28  5528.750000  40227.58984    3288.415039  6722.965820  
+2025-04-29  5560.830078  40527.62109    3286.655029  6749.075195  
+2025-04-30  5569.060059  40669.35938    3279.031006  6766.794922  
+2025-05-01  5604.140137  40752.96094    3279.031006  6766.794922  
+
+[3654 rows x 14 columns]
+--------------------------------------------------------------------------------
+Cell 5
+Cell type: code
+-- Code --
+plt.figure(figsize=(12, 7))
+plt.plot(df.index, df)
+plt.title(f"Dataset Plot")
+plt.xlabel("Date"); plt.ylabel("Price")
+plt.legend(labels=df.columns)
+plt.show()
+-- Outputs --
+[1] output_type: display_data
+<Figure size 1200x700 with 1 Axes>
+--------------------------------------------------------------------------------
+Cell 6
+Cell type: code
+-- Code --
+n = len(df)
+test_n = int(np.floor(TEST_SIZE * n))
+trainval_n = n - test_n
+val_n = int(np.floor(VAL_SIZE * trainval_n))
+train_n = trainval_n - val_n
+
+train_df = df.iloc[:train_n].copy()
+val_df   = df.iloc[train_n:train_n + val_n].copy()
+test_df  = df.iloc[train_n + val_n:].copy()
+
+print(f"Train: {len(train_df)} ({len(train_df)/len(df)*100:.1f}%) | "
+      f"Validation: {len(val_df)} ({len(val_df)/len(df)*100:.1f}%) | "
+      f"Test: {len(test_df)} ({len(test_df)/len(df)*100:.1f}%)")
+-- Outputs --
+[1] output_type: stream
+Train: 2632 (72.0%) | Validation: 292 (8.0%) | Test: 730 (20.0%)
+--------------------------------------------------------------------------------
+Cell 7
+Cell type: code
+-- Code --
+if INCLUDE_TARGET_AS_FEATURE:
+    feature_cols = df.columns.tolist()          # includes TARGET_COL (JKSE)
+else:
+    feature_cols = [c for c in df.columns if c != TARGET_COL]
+--------------------------------------------------------------------------------
+Cell 8
+Cell type: code
+-- Code --
+# feature_cols = [c for c in df.columns if c != TARGET_COL]
+X_scaler = StandardScaler()
+y_scaler = StandardScaler()
+X_scaler.fit(train_df[feature_cols])
+y_scaler.fit(train_df[[TARGET_COL]])
+y_mean  = float(y_scaler.mean_[0])
+y_scale = float(y_scaler.scale_[0])
+
+def scale_block(block):
+    X = X_scaler.transform(block[feature_cols])
+    y = y_scaler.transform(block[[TARGET_COL]])
+    return pd.DataFrame(X, index=block.index, columns=feature_cols), pd.DataFrame(y, index=block.index, columns=[TARGET_COL])
+
+X_train_s, y_train_s = scale_block(train_df)
+X_val_s,   y_val_s   = scale_block(val_df)
+X_test_s,  y_test_s  = scale_block(test_df)
+--------------------------------------------------------------------------------
+Cell 9
+Cell type: code
+-- Code --
+def make_windows(X_df, y_df, lookback):
+    X_vals = X_df.values
+    y_vals = y_df.values.squeeze()
+    idx = X_df.index
+
+    X_list, y_list, idx_list = [], [], []
+    for i in range(lookback, len(X_df)):
+        X_list.append(X_vals[i - lookback:i, :])
+        y_list.append(y_vals[i])
+        idx_list.append(idx[i])
+
+    X_arr = np.array(X_list, dtype=np.float32)
+    y_arr = np.array(y_list, dtype=np.float32)
+    idx_arr = np.array(idx_list)
+    return X_arr, y_arr, idx_arr
+--------------------------------------------------------------------------------
+Cell 10
+Cell type: code
+-- Code --
+def compute_metrics(y_true, y_pred):
+    mse  = mean_squared_error(y_true, y_pred)
+    mae  = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mape = mean_absolute_percentage_error(y_true, y_pred)
+    r2   = r2_score(y_true, y_pred)
+    return [mse, mae, rmse, mape, r2]
+--------------------------------------------------------------------------------
+Cell 11
+Cell type: code
+-- Code --
+def tcn_block(x, filters, kernel_size, dilation_rate, dropout_rate, use_layernorm=True):
+    y = Conv1D(filters, kernel_size, padding="causal", dilation_rate=dilation_rate)(x)
+    if use_layernorm:
+        y = LayerNormalization()(y)
+    y = Activation("relu")(y)
+    y = SpatialDropout1D(dropout_rate)(y)
+
+    y = Conv1D(filters, kernel_size, padding="causal", dilation_rate=dilation_rate)(y)
+    if use_layernorm:
+        y = LayerNormalization()(y)
+    y = Activation("relu")(y)
+    y = SpatialDropout1D(dropout_rate)(y)
+
+    # residual connection (project channels if needed)
+    if x.shape[-1] != filters:
+        x = Conv1D(filters, 1, padding="same")(x)
+    return Add()([x, y])
+
+def build_tcn_model(lookback, n_features, filters, kernel_size, dropout, dilations, num_stacks, lr, use_layernorm=True):
+    inp = Input(shape=(lookback, n_features))
+    x = inp
+    for _ in range(num_stacks):
+        for d in dilations:
+            x = tcn_block(x, filters, kernel_size, d, dropout, use_layernorm)
+
+    # compress and take last step
+    x = Conv1D(1, 1, padding="same")(x)
+    x = Lambda(lambda t: t[:, -1, :])(x)  # (batch, 1)
+    out = Dense(1)(x)
+
+    model = Model(inputs=inp, outputs=out)
+    model.compile(optimizer=optimizers.Adam(learning_rate=lr), loss="mse")
+    return model
+--------------------------------------------------------------------------------
+Cell 12
+Cell type: code
+-- Code --
+def objective(trial):
+    lookback   = trial.suggest_categorical("lookback", [30, 45, 60, 90])
+    filters    = trial.suggest_int("filters", 32, 128, step=32)
+    kernel_sz  = trial.suggest_categorical("kernel_size", [3, 5, 7])
+    dropout    = trial.suggest_float("dropout", 0.0, 0.5)
+    num_stacks = trial.suggest_int("num_stacks", 1, 2)
+    dilation_set = trial.suggest_categorical("dilations", [
+        (1, 2, 4),
+        (1, 2, 4, 8)
+    ])
+    lr         = trial.suggest_float("lr", 1e-4, 5e-3, log=True)
+    batch_size = trial.suggest_categorical("batch_size", [32, 64, 128])
+    epochs     = trial.suggest_int("epochs", 30, 100, step=10)
+    patience   = trial.suggest_int("patience", 5, 10)
+
+    X_tr, y_tr, _ = make_windows(X_train_s, y_train_s, lookback)
+    X_va, y_va, _ = make_windows(X_val_s,   y_val_s,   lookback)
+
+    model = build_tcn_model(
+        lookback=lookback,
+        n_features=len(feature_cols),
+        filters=filters,
+        kernel_size=kernel_sz,
+        dropout=dropout,
+        dilations=list(dilation_set),
+        num_stacks=num_stacks,
+        lr=lr,
+        use_layernorm=True
+    )
+
+    callbacks = [
+        EarlyStopping(monitor="val_loss", patience=patience, restore_best_weights=True),
+        TFKerasPruningCallback(trial, monitor="val_loss"),
+    ]
+
+    history = model.fit(
+        X_tr, y_tr,
+        validation_data=(X_va, y_va),
+        epochs=epochs,
+        batch_size=batch_size,
+        verbose=0,
+        callbacks=callbacks
+    )
+    return min(history.history["val_loss"])
+--------------------------------------------------------------------------------
+Cell 13
+Cell type: code
+-- Code --
+sampler = optuna.samplers.TPESampler(seed=RANDOM_SEED)
+pruner  = optuna.pruners.MedianPruner(n_startup_trials=15, n_warmup_steps=10)
+study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
+
+print("\nStarting Optuna study...")
+start_opt = time.time()
+study.optimize(objective, n_trials=N_TRIALS, show_progress_bar=True)
+end_opt = time.time()
+print(f"Optuna finished in {end_opt - start_opt:.4f} seconds")
+print("Best trial:", study.best_trial.number)
+print("Best val_loss:", study.best_value)
+print("Best params:", study.best_params)
+
+best = study.best_params
+BEST_LOOKBACK = best["lookback"]
+-- Outputs --
+[1] output_type: stream
+[I 2025-11-25 23:44:00,643] A new study created in memory with name: no-name-9d005c39-c5ed-43d8-a4f3-d32cde70895c
+[2] output_type: stream
+
+Starting Optuna study...
+[3] output_type: display_data
+  0%|          | 0/50 [00:00<?, ?it/s]
+[4] output_type: stream
+C:\Users\Alden\AppData\Roaming\Python\Python311\site-packages\optuna\distributions.py:515: UserWarning: Choices for a categorical distribution should be a tuple of None, bool, int, float and str for persistent storage but contains (1, 2, 4) which is of type tuple.
+  warnings.warn(message)
+C:\Users\Alden\AppData\Roaming\Python\Python311\site-packages\optuna\distributions.py:515: UserWarning: Choices for a categorical distribution should be a tuple of None, bool, int, float and str for persistent storage but contains (1, 2, 4, 8) which is of type tuple.
+  warnings.warn(message)
+[5] output_type: stream
+WARNING:tensorflow:From C:\Users\Alden\AppData\Roaming\Python\Python311\site-packages\keras\src\backend\tensorflow\core.py:222: The name tf.placeholder is deprecated. Please use tf.compat.v1.placeholder instead.
+
+[I 2025-11-25 23:46:13,525] Trial 0 finished with value: 0.0035031146835535765 and parameters: {'lookback': 45, 'filters': 32, 'kernel_size': 7, 'dropout': 0.3005575058716044, 'num_stacks': 2, 'dilations': (1, 2, 4, 8), 'lr': 0.002595942550311264, 'batch_size': 32, 'epochs': 50, 'patience': 8}. Best is trial 0 with value: 0.0035031146835535765.
+[I 2025-11-25 23:52:01,611] Trial 1 finished with value: 0.013764714822173119 and parameters: {'lookback': 60, 'filters': 64, 'kernel_size': 7, 'dropout': 0.09983689107917987, 'num_stacks': 2, 'dilations': (1, 2, 4), 'lr': 0.001076962247826313, 'batch_size': 128, 'epochs': 100, 'patience': 9}. Best is trial 0 with value: 0.0035031146835535765.
+[I 2025-11-25 23:56:45,718] Trial 2 finished with value: 0.021224087104201317 and parameters: {'lookback': 60, 'filters': 32, 'kernel_size': 7, 'dropout': 0.12938999080000846, 'num_stacks': 2, 'dilations': (1, 2, 4, 8), 'lr': 0.0008488762161408717, 'batch_size': 64, 'epochs': 100, 'patience': 10}. Best is trial 0 with value: 0.0035031146835535765.
+[I 2025-11-25 23:58:00,895] Trial 3 finished with value: 0.1211809515953064 and parameters: {'lookback': 45, 'filters': 32, 'kernel_size': 5, 'dropout': 0.41436875457596467, 'num_stacks': 1, 'dilations': (1, 2, 4, 8), 'lr': 0.000173550564698551, 'batch_size': 128, 'epochs': 90, 'patience': 6}. Best is trial 0 with value: 0.0035031146835535765.
+[I 2025-11-25 23:59:31,896] Trial 4 finished with value: 0.035200946033000946 and parameters: {'lookback': 45, 'filters': 128, 'kernel_size': 5, 'dropout': 0.43155171293779676, 'num_stacks': 2, 'dilations': (1, 2, 4), 'lr': 0.0003375589571206087, 'batch_size': 64, 'epochs': 100, 'patience': 7}. Best is trial 0 with value: 0.0035031146835535765.
+[I 2025-11-26 00:04:06,051] Trial 5 finished with value: 0.026222068816423416 and parameters: {'lookback': 60, 'filters': 128, 'kernel_size': 5, 'dropout': 0.012709563372047594, 'num_stacks': 1, 'dilations': (1, 2, 4, 8), 'lr': 0.00034204353211648276, 'batch_size': 64, 'epochs': 60, 'patience': 9}. Best is trial 0 with value: 0.0035031146835535765.
+[I 2025-11-26 00:05:58,492] Trial 6 finished with value: 0.0035879702772945166 and parameters: {'lookback': 60, 'filters': 128, 'kernel_size': 7, 'dropout': 0.40183603844955723, 'num_stacks': 1, 'dilations': (1, 2, 4), 'lr': 0.002354054991673985, 'batch_size': 32, 'epochs': 40, 'patience': 7}. Best is trial 0 with value: 0.0035031146835535765.
+[I 2025-11-26 00:06:32,780] Trial 7 finished with value: 0.07272122800350189 and parameters: {'lookback': 45, 'filters': 64, 'kernel_size': 7, 'dropout': 0.4714548519562596, 'num_stacks': 1, 'dilations': (1, 2, 4, 8), 'lr': 0.00041475896984548505, 'batch_size': 32, 'epochs': 60, 'patience': 6}. Best is trial 0 with value: 0.0035031146835535765.
+[I 2025-11-26 00:07:46,163] Trial 8 finished with value: 0.01307245809584856 and parameters: {'lookback': 60, 'filters': 32, 'kernel_size': 5, 'dropout': 0.07244743604561155, 'num_stacks': 1, 'dilations': (1, 2, 4), 'lr': 0.0013865582968261494, 'batch_size': 32, 'epochs': 50, 'patience': 8}. Best is trial 0 with value: 0.0035031146835535765.
+[I 2025-11-26 00:09:36,108] Trial 9 finished with value: 0.003582282457500696 and parameters: {'lookback': 90, 'filters': 64, 'kernel_size': 7, 'dropout': 0.3387821809211412, 'num_stacks': 1, 'dilations': (1, 2, 4), 'lr': 0.0012477547117579705, 'batch_size': 64, 'epochs': 100, 'patience': 5}. Best is trial 0 with value: 0.0035031146835535765.
+[I 2025-11-26 00:12:43,293] Trial 10 finished with value: 0.003295712638646364 and parameters: {'lookback': 30, 'filters': 96, 'kernel_size': 3, 'dropout': 0.24252881358288347, 'num_stacks': 2, 'dilations': (1, 2, 4, 8), 'lr': 0.0044678655766407695, 'batch_size': 32, 'epochs': 30, 'patience': 8}. Best is trial 10 with value: 0.003295712638646364.
+[I 2025-11-26 00:15:44,284] Trial 11 finished with value: 0.005255574360489845 and parameters: {'lookback': 30, 'filters': 96, 'kernel_size': 3, 'dropout': 0.24307602962940228, 'num_stacks': 2, 'dilations': (1, 2, 4, 8), 'lr': 0.004899069214822899, 'batch_size': 32, 'epochs': 30, 'patience': 8}. Best is trial 10 with value: 0.003295712638646364.
+[I 2025-11-26 00:19:16,775] Trial 12 finished with value: 0.003900804091244936 and parameters: {'lookback': 30, 'filters': 96, 'kernel_size': 3, 'dropout': 0.24209078224175992, 'num_stacks': 2, 'dilations': (1, 2, 4, 8), 'lr': 0.004834377580787896, 'batch_size': 32, 'epochs': 30, 'patience': 9}. Best is trial 10 with value: 0.003295712638646364.
+[I 2025-11-26 00:25:56,207] Trial 13 finished with value: 0.00393375800922513 and parameters: {'lookback': 30, 'filters': 96, 'kernel_size': 3, 'dropout': 0.3114590948615008, 'num_stacks': 2, 'dilations': (1, 2, 4, 8), 'lr': 0.0024283562576646314, 'batch_size': 32, 'epochs': 80, 'patience': 8}. Best is trial 10 with value: 0.003295712638646364.
+[I 2025-11-26 00:36:07,411] Trial 14 finished with value: 0.003252080176025629 and parameters: {'lookback': 90, 'filters': 64, 'kernel_size': 3, 'dropout': 0.17349234905344635, 'num_stacks': 2, 'dilations': (1, 2, 4, 8), 'lr': 0.002560714033538927, 'batch_size': 32, 'epochs': 40, 'patience': 10}. Best is trial 14 with value: 0.003252080176025629.
+[I 2025-11-26 00:44:08,249] Trial 15 finished with value: 0.0036181567702442408 and parameters: {'lookback': 90, 'filters': 96, 'kernel_size': 3, 'dropout': 0.17123601668560665, 'num_stacks': 2, 'dilations': (1, 2, 4, 8), 'lr': 0.0032821727662777677, 'batch_size': 32, 'epochs': 40, 'patience': 10}. Best is trial 14 with value: 0.003252080176025629.
+[I 2025-11-26 00:46:21,827] Trial 16 pruned. Trial was pruned at epoch 11.
+[I 2025-11-26 00:49:19,944] Trial 17 finished with value: 0.0451524443924427 and parameters: {'lookback': 30, 'filters': 96, 'kernel_size': 3, 'dropout': 0.19540769052229306, 'num_stacks': 2, 'dilations': (1, 2, 4, 8), 'lr': 0.0005550222698220122, 'batch_size': 32, 'epochs': 70, 'patience': 9}. Best is trial 14 with value: 0.003252080176025629.
+[I 2025-11-26 00:52:26,960] Trial 18 finished with value: 0.010183055885136127 and parameters: {'lookback': 90, 'filters': 64, 'kernel_size': 3, 'dropout': 0.030377331518590234, 'num_stacks': 2, 'dilations': (1, 2, 4, 8), 'lr': 0.00349353748759227, 'batch_size': 32, 'epochs': 30, 'patience': 6}. Best is trial 14 with value: 0.003252080176025629.
+[I 2025-11-26 00:57:14,260] Trial 19 pruned. Trial was pruned at epoch 10.
+[I 2025-11-26 00:58:56,662] Trial 20 pruned. Trial was pruned at epoch 10.
+[I 2025-11-26 01:03:06,982] Trial 21 finished with value: 0.003172466531395912 and parameters: {'lookback': 45, 'filters': 32, 'kernel_size': 7, 'dropout': 0.29103368955293857, 'num_stacks': 2, 'dilations': (1, 2, 4, 8), 'lr': 0.002921538930326156, 'batch_size': 32, 'epochs': 50, 'patience': 8}. Best is trial 21 with value: 0.003172466531395912.
+[I 2025-11-26 01:04:36,181] Trial 22 pruned. Trial was pruned at epoch 11.
+[I 2025-11-26 01:06:27,986] Trial 23 pruned. Trial was pruned at epoch 10.
+[I 2025-11-26 01:08:05,026] Trial 24 pruned. Trial was pruned at epoch 11.
+[I 2025-11-26 01:12:33,913] Trial 25 finished with value: 0.012231774628162384 and parameters: {'lookback': 30, 'filters': 96, 'kernel_size': 7, 'dropout': 0.15976075919060445, 'num_stacks': 2, 'dilations': (1, 2, 4, 8), 'lr': 0.002824896927122248, 'batch_size': 32, 'epochs': 60, 'patience': 5}. Best is trial 21 with value: 0.003172466531395912.
+[I 2025-11-26 01:15:28,559] Trial 26 finished with value: 0.003134095575660467 and parameters: {'lookback': 30, 'filters': 64, 'kernel_size': 3, 'dropout': 0.36696179455344446, 'num_stacks': 2, 'dilations': (1, 2, 4), 'lr': 0.0042575849800874, 'batch_size': 32, 'epochs': 70, 'patience': 9}. Best is trial 26 with value: 0.003134095575660467.
+[I 2025-11-26 01:17:36,457] Trial 27 pruned. Trial was pruned at epoch 11.
+[I 2025-11-26 01:19:29,186] Trial 28 pruned. Trial was pruned at epoch 10.
+[I 2025-11-26 01:24:49,867] Trial 29 finished with value: 0.004136563278734684 and parameters: {'lookback': 45, 'filters': 32, 'kernel_size': 7, 'dropout': 0.3199727676479955, 'num_stacks': 2, 'dilations': (1, 2, 4), 'lr': 0.0031593211177551243, 'batch_size': 64, 'epochs': 50, 'patience': 9}. Best is trial 26 with value: 0.003134095575660467.
+[I 2025-11-26 01:29:54,874] Trial 30 pruned. Trial was pruned at epoch 12.
+[I 2025-11-26 01:33:17,365] Trial 31 pruned. Trial was pruned at epoch 10.
+[I 2025-11-26 01:35:03,000] Trial 32 pruned. Trial was pruned at epoch 12.
+[I 2025-11-26 01:37:08,269] Trial 33 pruned. Trial was pruned at epoch 10.
+[I 2025-11-26 01:39:48,181] Trial 34 finished with value: 0.0037442613393068314 and parameters: {'lookback': 30, 'filters': 64, 'kernel_size': 3, 'dropout': 0.2839778391003962, 'num_stacks': 2, 'dilations': (1, 2, 4), 'lr': 0.003987393820600199, 'batch_size': 32, 'epochs': 60, 'patience': 8}. Best is trial 26 with value: 0.003134095575660467.
+[I 2025-11-26 01:44:21,279] Trial 35 pruned. Trial was pruned at epoch 11.
+[I 2025-11-26 01:47:01,965] Trial 36 pruned. Trial was pruned at epoch 10.
+[I 2025-11-26 01:48:21,788] Trial 37 pruned. Trial was pruned at epoch 12.
+[I 2025-11-26 01:49:49,639] Trial 38 pruned. Trial was pruned at epoch 10.
+[I 2025-11-26 01:53:14,687] Trial 39 pruned. Trial was pruned at epoch 13.
+[I 2025-11-26 01:53:40,137] Trial 40 pruned. Trial was pruned at epoch 10.
+[I 2025-11-26 01:54:16,107] Trial 41 finished with value: 0.04682805761694908 and parameters: {'lookback': 45, 'filters': 32, 'kernel_size': 7, 'dropout': 0.28860078997686905, 'num_stacks': 2, 'dilations': (1, 2, 4, 8), 'lr': 0.002039857208621375, 'batch_size': 32, 'epochs': 50, 'patience': 8}. Best is trial 26 with value: 0.003134095575660467.
+[I 2025-11-26 01:55:50,818] Trial 42 finished with value: 0.003518475219607353 and parameters: {'lookback': 45, 'filters': 32, 'kernel_size': 7, 'dropout': 0.39132855922867443, 'num_stacks': 2, 'dilations': (1, 2, 4, 8), 'lr': 0.003446530531574027, 'batch_size': 32, 'epochs': 70, 'patience': 9}. Best is trial 26 with value: 0.003134095575660467.
+[I 2025-11-26 01:58:07,065] Trial 43 finished with value: 0.0034342948347330093 and parameters: {'lookback': 45, 'filters': 64, 'kernel_size': 7, 'dropout': 0.2428679872033945, 'num_stacks': 2, 'dilations': (1, 2, 4, 8), 'lr': 0.0024825221950644876, 'batch_size': 32, 'epochs': 60, 'patience': 8}. Best is trial 26 with value: 0.003134095575660467.
+[I 2025-11-26 01:59:36,276] Trial 44 pruned. Trial was pruned at epoch 17.
+[I 2025-11-26 02:00:39,823] Trial 45 pruned. Trial was pruned at epoch 11.
+[I 2025-11-26 02:01:41,272] Trial 46 pruned. Trial was pruned at epoch 10.
+[I 2025-11-26 02:04:53,963] Trial 47 finished with value: 0.0034530311822891235 and parameters: {'lookback': 45, 'filters': 96, 'kernel_size': 5, 'dropout': 0.1566789726233458, 'num_stacks': 2, 'dilations': (1, 2, 4), 'lr': 0.0024960813195172723, 'batch_size': 32, 'epochs': 40, 'patience': 10}. Best is trial 26 with value: 0.003134095575660467.
+[I 2025-11-26 02:07:09,939] Trial 48 pruned. Trial was pruned at epoch 12.
+[I 2025-11-26 02:08:38,224] Trial 49 finished with value: 0.003000416560098529 and parameters: {'lookback': 30, 'filters': 96, 'kernel_size': 7, 'dropout': 0.3234539817809136, 'num_stacks': 1, 'dilations': (1, 2, 4, 8), 'lr': 0.0034835310260960288, 'batch_size': 32, 'epochs': 50, 'patience': 7}. Best is trial 49 with value: 0.003000416560098529.
+Optuna finished in 8677.5848 seconds
+Best trial: 49
+Best val_loss: 0.003000416560098529
+Best params: {'lookback': 30, 'filters': 96, 'kernel_size': 7, 'dropout': 0.3234539817809136, 'num_stacks': 1, 'dilations': (1, 2, 4, 8), 'lr': 0.0034835310260960288, 'batch_size': 32, 'epochs': 50, 'patience': 7}
+--------------------------------------------------------------------------------
+Cell 14
+Cell type: code
+-- Code --
+X_train_w, y_train_w, idx_train = make_windows(X_train_s, y_train_s, BEST_LOOKBACK)
+X_val_w,   y_val_w,   idx_val   = make_windows(X_val_s,   y_val_s,   BEST_LOOKBACK)
+X_test_w,  y_test_w,  idx_test  = make_windows(X_test_s,  y_test_s,  BEST_LOOKBACK)
+--------------------------------------------------------------------------------
+Cell 15
+Cell type: code
+-- Code --
+final_model = build_tcn_model(
+    lookback=BEST_LOOKBACK,
+    n_features=len(feature_cols),
+    filters=best["filters"],
+    kernel_size=best["kernel_size"],
+    dropout=best["dropout"],
+    dilations=list(best["dilations"]),
+    num_stacks=best["num_stacks"],
+    lr=best["lr"],
+    use_layernorm=True
+)
+
+callbacks = [
+    EarlyStopping(monitor="val_loss", patience=best["patience"], restore_best_weights=True),
+    ModelCheckpoint("Model Checkpoints/tcn_optuna_best.keras", monitor="val_loss", save_best_only=True)
+]
+
+print("\nRetraining final TCN on TRAIN (validate on VAL)...")
+start_train = time.time()
+history = final_model.fit(
+    X_train_w, y_train_w,
+    validation_data=(X_val_w, y_val_w),
+    epochs=best["epochs"],
+    batch_size=best["batch_size"],
+    verbose=1,
+    callbacks=callbacks
+)
+end_train = time.time()
+print(f"Final training time: {end_train - start_train:.4f} seconds")
+-- Outputs --
+[1] output_type: stream
+
+Retraining final TCN on TRAIN (validate on VAL)...
+Epoch 1/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m9s[0m 46ms/step - loss: 0.2859 - val_loss: 0.1070
+Epoch 2/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m3s[0m 38ms/step - loss: 0.0289 - val_loss: 0.1029
+Epoch 3/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 43ms/step - loss: 0.0181 - val_loss: 0.1256
+Epoch 4/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 54ms/step - loss: 0.0139 - val_loss: 0.0768
+Epoch 5/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 53ms/step - loss: 0.0117 - val_loss: 0.0631
+Epoch 6/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 54ms/step - loss: 0.0098 - val_loss: 0.0487
+Epoch 7/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 50ms/step - loss: 0.0080 - val_loss: 0.0558
+Epoch 8/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 52ms/step - loss: 0.0066 - val_loss: 0.0317
+Epoch 9/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 51ms/step - loss: 0.0059 - val_loss: 0.0284
+Epoch 10/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 51ms/step - loss: 0.0056 - val_loss: 0.0375
+Epoch 11/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 53ms/step - loss: 0.0054 - val_loss: 0.0184
+Epoch 12/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 53ms/step - loss: 0.0049 - val_loss: 0.0212
+Epoch 13/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 53ms/step - loss: 0.0048 - val_loss: 0.0140
+Epoch 14/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 53ms/step - loss: 0.0047 - val_loss: 0.0114
+Epoch 15/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 52ms/step - loss: 0.0046 - val_loss: 0.0113
+Epoch 16/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 53ms/step - loss: 0.0045 - val_loss: 0.0095
+Epoch 17/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 51ms/step - loss: 0.0044 - val_loss: 0.0105
+Epoch 18/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 52ms/step - loss: 0.0045 - val_loss: 0.0079
+Epoch 19/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 50ms/step - loss: 0.0044 - val_loss: 0.0089
+Epoch 20/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 50ms/step - loss: 0.0043 - val_loss: 0.0091
+Epoch 21/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 53ms/step - loss: 0.0045 - val_loss: 0.0067
+Epoch 22/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 51ms/step - loss: 0.0044 - val_loss: 0.0068
+Epoch 23/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 52ms/step - loss: 0.0044 - val_loss: 0.0066
+Epoch 24/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 52ms/step - loss: 0.0045 - val_loss: 0.0059
+Epoch 25/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 52ms/step - loss: 0.0044 - val_loss: 0.0058
+Epoch 26/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m5s[0m 58ms/step - loss: 0.0044 - val_loss: 0.0052
+Epoch 27/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m5s[0m 55ms/step - loss: 0.0044 - val_loss: 0.0052
+Epoch 28/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 53ms/step - loss: 0.0045 - val_loss: 0.0049
+Epoch 29/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 52ms/step - loss: 0.0044 - val_loss: 0.0054
+Epoch 30/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m5s[0m 56ms/step - loss: 0.0044 - val_loss: 0.0055
+Epoch 31/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 54ms/step - loss: 0.0044 - val_loss: 0.0049
+Epoch 32/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 53ms/step - loss: 0.0044 - val_loss: 0.0049
+Epoch 33/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m5s[0m 55ms/step - loss: 0.0047 - val_loss: 0.0045
+Epoch 34/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m5s[0m 55ms/step - loss: 0.0044 - val_loss: 0.0044
+Epoch 35/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 52ms/step - loss: 0.0044 - val_loss: 0.0047
+Epoch 36/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 51ms/step - loss: 0.0045 - val_loss: 0.0051
+Epoch 37/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 52ms/step - loss: 0.0046 - val_loss: 0.0046
+Epoch 38/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 52ms/step - loss: 0.0045 - val_loss: 0.0045
+Epoch 39/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 53ms/step - loss: 0.0045 - val_loss: 0.0043
+Epoch 40/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m5s[0m 56ms/step - loss: 0.0046 - val_loss: 0.0044
+Epoch 41/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 52ms/step - loss: 0.0045 - val_loss: 0.0043
+Epoch 42/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 51ms/step - loss: 0.0045 - val_loss: 0.0046
+Epoch 43/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 52ms/step - loss: 0.0044 - val_loss: 0.0047
+Epoch 44/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 51ms/step - loss: 0.0044 - val_loss: 0.0046
+Epoch 45/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 53ms/step - loss: 0.0045 - val_loss: 0.0048
+Epoch 46/50
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m4s[0m 52ms/step - loss: 0.0046 - val_loss: 0.0051
+Final training time: 203.0615 seconds
+--------------------------------------------------------------------------------
+Cell 16
+Cell type: code
+-- Code --
+def predict_series(model, X_block, idx_block):
+    yhat_s = model.predict(X_block, verbose=0)
+    yhat = y_scaler.inverse_transform(yhat_s).squeeze()
+    return pd.Series(yhat, index=idx_block, name="Pred")
+
+pred_train = predict_series(final_model, X_train_w, idx_train)
+pred_val   = predict_series(final_model, X_val_w,   idx_val)
+
+start_test = time.time()
+pred_test  = predict_series(final_model, X_test_w,  idx_test)
+end_test = time.time()
+print(f"Testing (inference) time: {end_test - start_test:.4f} seconds")
+-- Outputs --
+[1] output_type: stream
+Testing (inference) time: 0.5187 seconds
+--------------------------------------------------------------------------------
+Cell 17
+Cell type: code
+-- Code --
+actual       = df[TARGET_COL]
+actual_train = actual.loc[idx_train]
+actual_val   = actual.loc[idx_val]
+actual_test  = actual.loc[idx_test]
+--------------------------------------------------------------------------------
+Cell 18
+Cell type: code
+-- Code --
+metrics_train = compute_metrics(actual_train.values, pred_train.values)
+metrics_val   = compute_metrics(actual_val.values,   pred_val.values)
+metrics_test  = compute_metrics(actual_test.values,  pred_test.values)
+
+metrics_df = pd.DataFrame(
+    [metrics_train, metrics_val, metrics_test],
+    columns=["MSE", "MAE", "RMSE", "MAPE", "R²"],
+    index=["Train", "Validation", "Test"]
+)
+
+pd.set_option("display.float_format", "{:.4f}".format)
+print("\n=== Metrics Summary (TCN — Optuna best) ===")
+print(metrics_df.round(4))
+-- Outputs --
+[1] output_type: stream
+
+=== Metrics Summary (TCN — Optuna best) ===
+                 MSE     MAE    RMSE   MAPE     R²
+Train      2086.3063 31.5734 45.6761 0.0057 0.9958
+Validation 2158.4087 34.0384 46.4587 0.0049 0.9204
+Test       6027.7383 64.9537 77.6385 0.0092 0.9465
+--------------------------------------------------------------------------------
+Cell 19
+Cell type: code
+-- Code --
+# === NEW: base_metrics (dict) & UQ metrics ===
+def base_metrics(y_true, y_pred):
+    mse  = mean_squared_error(y_true, y_pred)
+    mae  = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mape = mean_absolute_percentage_error(y_true, y_pred)
+    r2   = r2_score(y_true, y_pred)
+    return dict(MSE=mse, MAE=mae, RMSE=rmse, MAPE=mape, R2=r2)
+
+def uq_metrics(y_true, L, U, alpha=ALPHA):
+    y = np.asarray(y_true); L = np.asarray(L); U = np.asarray(U)
+    cover = (y >= L) & (y <= U)
+    picp = cover.mean()
+    mpiw = np.mean(U - L)
+
+    penalty = np.where(y < L, (2/alpha)*(L - y),
+              np.where(y > U, (2/alpha)*(y - U), 0.0))
+
+    winkler = np.mean((U - L) + penalty)
+    return dict(PICP=picp, MPIW=mpiw, Winkler=winkler)
+--------------------------------------------------------------------------------
+Cell 20
+Cell type: code
+-- Code --
+# === NEW: Monte-Carlo Dropout on final_model ===
+@tf.function
+def mc_call(m, X, training=True):
+    # forces dropout layers (SpatialDropout1D) to stay active
+    return m(X, training=training)
+
+def predict_mc(m, X_np, idx, n_mc=N_MC, use_quantiles=USE_QUANTILES, alpha=ALPHA):
+    Ys_scaled = []
+    X_tf = tf.convert_to_tensor(X_np, dtype=tf.float32)
+    for _ in range(n_mc):
+        y_s = mc_call(m, X_tf, training=True).numpy().squeeze()  # (N,)
+        Ys_scaled.append(y_s)
+
+    Ys_scaled = np.stack(Ys_scaled, axis=1)   # (N, T)
+    Ys = Ys_scaled * y_scale + y_mean        # inverse scale whole ensemble
+
+    mean = Ys.mean(axis=1)
+    std  = Ys.std(axis=1, ddof=1)
+
+    if use_quantiles:
+        lower = np.quantile(Ys, q=alpha/2,     axis=1)
+        upper = np.quantile(Ys, q=1-alpha/2.0, axis=1)
+    else:
+        from scipy.stats import norm
+        z = norm.ppf(1 - alpha/2.0)
+        lower, upper = mean - z * std, mean + z * std
+
+    return (
+        pd.Series(mean,  index=idx, name="mean"),
+        pd.Series(lower, index=idx, name=f"lower_{int((1-alpha)*100)}"),
+        pd.Series(upper, index=idx, name=f"upper_{int((1-alpha)*100)}"),
+        pd.Series(std,   index=idx, name="mc_std"),
+        Ys  # all MC samples in real scale, shape (N, T)
+    )
+
+print("\nRunning MC Dropout on Optuna-tuned TCN...")
+mean_train, L_train, U_train, std_train, Ys_train = predict_mc(final_model, X_train_w, idx_train)
+mean_val,   L_val,   U_val,   std_val,   Ys_val   = predict_mc(final_model, X_val_w,   idx_val)
+mean_test,  L_test,  U_test,  std_test,  Ys_test  = predict_mc(final_model, X_test_w,  idx_test)
+-- Outputs --
+[1] output_type: stream
+
+Running MC Dropout on Optuna-tuned TCN...
+--------------------------------------------------------------------------------
+Cell 21
+Cell type: code
+-- Code --
+print(f"\n=== UQ Metrics ({int((1-ALPHA)*100)}% PI) — MC on Optuna TCN ===")
+print("Train:", uq_metrics(actual_train.values, L_train.values, U_train.values, ALPHA))
+print("Val:  ", uq_metrics(actual_val.values,   L_val.values,   U_val.values,   ALPHA))
+print("Test: ", uq_metrics(actual_test.values,  L_test.values,  U_test.values,  ALPHA))
+
+# Summary table using MC mean as point forecast
+rows = []
+for tag, y_true_s, y_pred_s, L_s, U_s in [
+    ("Train", actual_train, mean_train, L_train, U_train),
+    ("Val",   actual_val,   mean_val,   L_val,   U_val),
+    ("Test",  actual_test,  mean_test,  L_test,  U_test),
+]:
+    b = base_metrics(y_true_s.values, y_pred_s.values)
+    u = uq_metrics(y_true_s.values, L_s.values, U_s.values, ALPHA)
+    rows.append({
+        "Split": tag,
+        **{k: round(v,4) for k,v in b.items()},
+        "PICP": round(u["PICP"],4),
+        "MPIW": round(u["MPIW"],4),
+        "Winkler": round(u["Winkler"],4)
+    })
+
+summary_mc_df = pd.DataFrame(rows)
+print("\n=== Summary (Point = MC mean + UQ) — TCN (Optuna) + MC Dropout ===")
+print(summary_mc_df.to_string(index=False))
+-- Outputs --
+[1] output_type: stream
+
+=== UQ Metrics (95% PI) — MC on Optuna TCN ===
+Train: {'PICP': 0.3166794773251345, 'MPIW': 25.558378827434428, 'Winkler': 858.8681963480619}
+Val:   {'PICP': 0.3053435114503817, 'MPIW': 28.47742253660246, 'Winkler': 917.965515699174}
+Test:  {'PICP': 0.08142857142857143, 'MPIW': 25.20753892299108, 'Winkler': 2092.659809072544}
+
+=== Summary (Point = MC mean + UQ) — TCN (Optuna) + MC Dropout ===
+Split       MSE     MAE    RMSE   MAPE     R2   PICP    MPIW   Winkler
+Train 2074.7228 31.4360 45.5491 0.0056 0.9959 0.3167 25.5584  858.8682
+  Val 2189.6111 34.2923 46.7933 0.0050 0.9192 0.3053 28.4774  917.9655
+ Test 5872.0253 63.8670 76.6291 0.0090 0.9479 0.0814 25.2075 2092.6598
+--------------------------------------------------------------------------------
+Cell 22
+Cell type: code
+-- Code --
+# === NEW: approximate epistemic vs aleatoric on test ===
+resid_val = actual_val.values - mean_val.values
+sigma2_aleatoric = np.var(resid_val, ddof=1)
+
+var_total_test = np.var(Ys_test, axis=1, ddof=1)
+var_epistemic  = np.maximum(0.0, var_total_test - sigma2_aleatoric)
+var_aleatoric  = np.full_like(var_total_test, sigma2_aleatoric)
+
+epi_series = pd.Series(var_epistemic, index=idx_test, name="var_epistemic")
+ale_series = pd.Series(var_aleatoric, index=idx_test, name="var_aleatoric")
+tot_series = pd.Series(var_total_test, index=idx_test, name="var_total")
+--------------------------------------------------------------------------------
+Cell 23
+Cell type: code
+-- Code --
+# === NEW: full-series + test-horizon plots with MC PI ===
+def classify_inside_outside(y_true_s, L_s, U_s):
+    y = np.asarray(y_true_s); L = np.asarray(L_s); U = np.asarray(U_s)
+    inside = (y >= L) & (y <= U)
+    return inside, ~inside
+
+# 1) Full series view
+plt.figure(figsize=(12,5))
+plt.plot(actual.index, actual.values, label="Actual", linewidth=1)
+plt.plot(mean_train.index, mean_train.values, label="Pred (Train, MC mean)", linewidth=1)
+plt.plot(mean_val.index,   mean_val.values,   label="Pred (Val, MC mean)", linewidth=1)
+plt.plot(mean_test.index,  mean_test.values,  label="Pred (Test, MC mean)", linewidth=1.5)
+plt.fill_between(L_test.index, L_test.values, U_test.values, alpha=0.25,
+                 label=f"{int((1-ALPHA)*100)}% PI (Test)")
+plt.title("All Actual vs Predicted — TCN (Optuna) + MC Dropout")
+plt.xlabel("Date"); plt.ylabel(TARGET_COL); plt.legend(); plt.tight_layout(); plt.show()
+
+# 2) Test horizon with inside/outside markers
+inside_mask, outside_mask = classify_inside_outside(actual_test.values, L_test.values, U_test.values)
+plt.figure(figsize=(12,5))
+plt.plot(actual_test.index, actual_test.values, label="Actual (Test)", linewidth=1.5)
+plt.plot(mean_test.index,   mean_test.values,   label="Pred (Test, MC mean)", linewidth=1.5)
+plt.fill_between(L_test.index, L_test.values, U_test.values, alpha=0.30,
+                 label=f"{int((1-ALPHA)*100)}% PI")
+plt.scatter(actual_test.index[inside_mask],  actual_test.values[inside_mask],
+            s=15, label="Inside PI", zorder=3, color="limegreen")
+plt.scatter(actual_test.index[outside_mask], actual_test.values[outside_mask],
+            s=25, marker="x", label="Outside PI", zorder=3, color="red")
+plt.title("Test Horizon: Actual vs MC Mean with Prediction Interval")
+plt.xlabel("Date"); plt.ylabel(TARGET_COL); plt.legend(); plt.tight_layout(); plt.show()
+
+# 3) Residuals (test)
+residuals_test = pd.Series(actual_test.values - mean_test.values, index=actual_test.index, name="Residuals")
+plt.figure(figsize=(12,4))
+plt.plot(residuals_test.index, residuals_test.values, linewidth=1)
+plt.axhline(0, ls="--", lw=1); plt.title("Residuals Over Time (Test) — TCN + MC")
+plt.xlabel("Date"); plt.ylabel("Actual - Pred"); plt.tight_layout(); plt.show()
+
+# 4) Uncertainty decomposition
+plt.figure(figsize=(12,5))
+plt.plot(epi_series.index, epi_series.values, label="Epistemic Var (≈)", linewidth=1)
+plt.plot(ale_series.index, ale_series.values, label="Aleatoric Var (proxy)", linewidth=1)
+plt.plot(tot_series.index, tot_series.values, label="Total Predictive Var (MC)", linewidth=1.2)
+plt.title("Uncertainty Decomposition Over Time (Test)")
+plt.xlabel("Date"); plt.ylabel("Variance"); plt.legend(); plt.tight_layout(); plt.show()
+-- Outputs --
+[1] output_type: display_data
+<Figure size 1200x500 with 1 Axes>
+[2] output_type: display_data
+<Figure size 1200x500 with 1 Axes>
+[3] output_type: display_data
+<Figure size 1200x400 with 1 Axes>
+[4] output_type: display_data
+<Figure size 1200x500 with 1 Axes>
+--------------------------------------------------------------------------------
+Cell 24
+Cell type: code
+-- Code --
+# ---------------------- (a) Coverage heatmap (per-window) ----------------------
+from matplotlib.colors import ListedColormap, BoundaryNorm
+y_true = actual_test.values; L_arr = L_test.values; U_arr = U_test.values
+below_mask = (y_true < L_arr); above_mask = (y_true > U_arr); inside_mask = (y_true >= L_arr) & (y_true <= U_arr)
+status = np.zeros_like(y_true, dtype=int); status[below_mask] = -1; status[above_mask] = 1
+starts = np.arange(0, len(status)-HEAT_WIN+1, HEAT_STRIDE)
+if len(starts) == 0: starts = np.array([0]); HEAT_WIN = len(status)
+mat = []; x_tick_labels = []
+for s in starts:
+    e = min(s + HEAT_WIN, len(status)); row = status[s:e]
+    if e - s < HEAT_WIN: row = np.pad(row, (0, HEAT_WIN - (e - s)), constant_values=np.nan)
+    mat.append(row); x_tick_labels.append(actual_test.index[s].strftime('%Y-%m-%d'))
+mat = np.vstack(mat)
+cmap = ListedColormap(["#d62728", "#2ca02c", "#ff7f0e", "#bdbdbd"])  # red, green, orange, grey
+bounds = [-1.5, -0.5, 0.5, 1.5, 2.5]; norm = BoundaryNorm(bounds, cmap.N)
+plt.figure(figsize=(12,6))
+plt.imshow(mat, aspect="auto", interpolation="nearest", cmap=cmap, norm=norm)
+plt.title(f"Coverage Heatmap (Test) — window={HEAT_WIN}, stride={HEAT_STRIDE}\n-1: Below | 0: Inside | +1: Above")
+plt.xlabel("Position inside window"); plt.ylabel("Window start time")
+yticks = np.arange(0, len(starts), max(1, len(starts)//10))
+plt.yticks(yticks, [x_tick_labels[i] for i in yticks])
+import matplotlib.patches as mpatches
+legend_patches = [
+    mpatches.Patch(color="#2ca02c", label="Inside PI"),
+    mpatches.Patch(color="#d62728", label="Below lower"),
+    mpatches.Patch(color="#ff7f0e", label="Above upper"),
+    mpatches.Patch(color="#bdbdbd", label="Padding")
+]
+plt.legend(handles=legend_patches, loc="upper right", frameon=True)
+plt.tight_layout(); plt.show()
+-- Outputs --
+[1] output_type: display_data
+<Figure size 1200x600 with 1 Axes>
+--------------------------------------------------------------------------------
+Cell 25
+Cell type: code
+-- Code --
+# ---------------------- (b) Rolling PICP & (c) Rolling MPIW ----------------------
+inside_series = pd.Series(((y_true >= L_arr) & (y_true <= U_arr)).astype(int), index=actual_test.index, name="inside")
+rolling_picp = inside_series.rolling(window=ROLL_LEN, center=True, min_periods=max(3, ROLL_LEN//3)).mean()
+plt.figure(figsize=(12,4))
+plt.plot(rolling_picp.index, rolling_picp.values, linewidth=1.8, label=f"Rolling PICP (window={ROLL_LEN})")
+plt.axhline(1 - ALPHA, ls="--", lw=1, label=f"Target coverage = {1-ALPHA:.2f}")
+plt.ylim(0, 1.05); plt.title("Rolling PICP on Test (Calibration over Time)")
+plt.xlabel("Date"); plt.ylabel("Coverage"); plt.legend(); plt.tight_layout(); plt.show()
+
+width_series   = pd.Series((U_arr - L_arr), index=actual_test.index, name="PI_width")
+rolling_mpiw   = width_series.rolling(window=ROLL_LEN, center=True, min_periods=max(3, ROLL_LEN//3)).mean()
+overall_mpiw_t = width_series.mean()
+plt.figure(figsize=(12,4))
+plt.plot(rolling_mpiw.index, rolling_mpiw.values, linewidth=1.8, label=f"Rolling MPIW (window={ROLL_LEN})")
+plt.axhline(overall_mpiw_t, ls="--", lw=1, label=f"Overall MPIW (Test) = {overall_mpiw_t:.2f}")
+plt.title("Rolling MPIW on Test (Sharpness over Time)")
+plt.xlabel("Date"); plt.ylabel("Interval Width"); plt.legend(); plt.tight_layout(); plt.show()
+-- Outputs --
+[1] output_type: display_data
+<Figure size 1200x400 with 1 Axes>
+[2] output_type: display_data
+<Figure size 1200x400 with 1 Axes>
+--------------------------------------------------------------------------------
+Cell 26
+Cell type: code
+-- Code --
+# (Optional) If you want a normalized comparison with Rolling PICP in a separate plot:
+norm_mpiw = (rolling_mpiw - np.nanmin(rolling_mpiw)) / (np.nanmax(rolling_mpiw) - np.nanmin(rolling_mpiw) + 1e-12)
+plt.figure(figsize=(12, 4))
+plt.plot(rolling_picp.index, rolling_picp.values, linewidth=1.8, label="Rolling PICP (0–1)")
+plt.plot(norm_mpiw.index, norm_mpiw.values, linewidth=1.5, label="Rolling MPIW (normalized 0–1)")
+plt.axhline(1 - ALPHA, ls="--", lw=1, label=f"Target coverage = {1-ALPHA:.2f}")
+plt.title("Rolling PICP vs Normalized Rolling MPIW (Test)")
+plt.xlabel("Date"); plt.ylabel("Scaled value")
+plt.legend(); plt.tight_layout(); plt.show()
+-- Outputs --
+[1] output_type: display_data
+<Figure size 1200x400 with 1 Axes>
+--------------------------------------------------------------------------------
+Cell 27
+Cell type: code
+-- Code --
+# ---------------------- Compact summary table ----------------------
+def table_metrics():
+    rows = []
+    for tag, y_true_s, y_pred_s, L_s, U_s in [
+        ("Train", actual_train, mean_train, L_train, U_train),
+        ("Val",   actual_val,   mean_val,   L_val,   U_val),
+        ("Test",  actual_test,  mean_test,  L_test,  U_test),
+    ]:
+        b = base_metrics(y_true_s.values, y_pred_s.values)
+        u = uq_metrics(y_true_s.values, L_s.values, U_s.values, ALPHA)
+        rows.append({"Split": tag, **{k: round(v,4) for k,v in b.items()}, "PICP": round(u["PICP"],4),
+                     "MPIW": round(u["MPIW"],4), "Winkler": round(u["Winkler"],4)})
+    return pd.DataFrame(rows)
+
+summary_df = table_metrics()
+print("\n=== Summary (Point + UQ) — TCN + MC Dropout ===")
+print(summary_df.to_string(index=False))
+-- Outputs --
+[1] output_type: stream
+
+=== Summary (Point + UQ) — TCN + MC Dropout ===
+Split       MSE     MAE    RMSE   MAPE     R2   PICP    MPIW   Winkler
+Train 2074.7228 31.4360 45.5491 0.0056 0.9959 0.3167 25.5584  858.8682
+  Val 2189.6111 34.2923 46.7933 0.0050 0.9192 0.3053 28.4774  917.9655
+ Test 5872.0253 63.8670 76.6291 0.0090 0.9479 0.0814 25.2075 2092.6598
+--------------------------------------------------------------------------------
+Cell 28
+Cell type: code
+-- Code --
+
+--------------------------------------------------------------------------------

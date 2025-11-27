@@ -1,10 +1,10 @@
 {
-  "lookback": 90,
-  "batch_size": 32,
-  "epochs": 60,
-  "patience": 9,
+  "lookback": 45,
+  "batch_size": 64,
+  "epochs": 70,
+  "patience": 5,
   "num_layers": 1,
-  "units1": 224,
-  "dropout": 0.04311815333001495,
-  "lr": 0.003646365785486806
+  "units1": 256,
+  "dropout": 0.3256890716132887,
+  "lr": 0.0004729718192044825
 }
