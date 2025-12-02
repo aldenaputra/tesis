@@ -1,0 +1,790 @@
+Notebook: LSTM_CQR_42.ipynb
+Kernelspec: {'display_name': 'tesis_env', 'language': 'python', 'name': 'python3'}
+
+--------------------------------------------------------------------------------
+Cell 1
+Cell type: code
+-- Code --
+# Uses NEW LSTM best hyperparameters; Optuna removed.  :contentReference[oaicite:1]{index=1}
+import time, numpy as np, pandas as pd, matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, mean_absolute_percentage_error
+import tensorflow as tf
+import random, os
+from datetime import datetime
+from tensorflow.keras import Sequential, Input, optimizers
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+--------------------------------------------------------------------------------
+Cell 2
+Cell type: code
+-- Code --
+# ---------------------- Config ----------------------
+CSV_PATH   = "ALL_MERGED.csv"   # <--- set your path
+DATE_COL   = "Date"
+TARGET_COL = "JKSE"
+INCLUDE_TARGET_AS_FEATURE = True
+
+TEST_SIZE  = 0.20
+VAL_SIZE   = 0.10
+RANDOM_SEED = 42
+
+# LSTM best (fixed from your latest study)
+BEST = dict(
+    lookback = 30,
+    batch_size = 32,
+    epochs = 60,
+    patience = 9,
+    num_layers = 1,
+    units1 = 224,
+    dropout = 0.2587686789138789,
+    lr = 0.004885367329470599
+)
+
+# Quantiles & conformal settings
+ALPHA = 0.05
+TAUS  = [ALPHA/2, 0.5, 1-ALPHA/2]   # [0.025, 0.5, 0.975]
+
+# Ensemble settings for epistemic/aleatoric via spread of members
+M_ENSEMBLE = 5
+BOOTSTRAP  = True
+SEED_BASE  = 42
+
+# Rolling/heatmap visuals
+ROLL_LEN   = 30
+HEAT_WIN   = 30
+HEAT_STRIDE= 10
+
+print(RANDOM_SEED)
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
+os.environ["PYTHONHASHSEED"] = str(RANDOM_SEED)
+-- Outputs --
+[1] output_type: stream
+42
+--------------------------------------------------------------------------------
+Cell 3
+Cell type: code
+-- Code --
+# ---------------------- Load & prep ----------------------
+df = pd.read_csv(CSV_PATH)
+required = [
+    "Date","Nickel_Fut","Coal_Fut_Newcastle","Palm_Oil_Fut",
+    "USD_IDR","CNY_IDR","EUR_IDR","BTC_USD",
+    "FTSE100","HANGSENG","NIKKEI225","SNP500","DOW30","SSE_Composite",TARGET_COL
+]
+missing = [c for c in required if c not in df.columns]
+if missing:
+    raise ValueError(f"Missing columns: {missing}")
+
+df[DATE_COL] = pd.to_datetime(df[DATE_COL])
+df = df.sort_values(DATE_COL).set_index(DATE_COL).ffill().bfill()
+df
+-- Outputs --
+[1] output_type: execute_result
+            Nickel_Fut  Coal_Fut_Newcastle  Palm_Oil_Fut  USD_IDR  CNY_IDR  \
+Date                                                                         
+2015-05-01    13750.00               62.20          2136  12962.5  2089.78   
+2015-05-02    13750.00               62.20          2136  12962.5  2089.78   
+2015-05-03    13750.00               62.20          2136  12962.5  2089.78   
+2015-05-04    13750.00               62.20          2136  12980.0  2090.51   
+2015-05-05    14245.00               62.50          2136  13047.5  2102.39   
+...                ...                 ...           ...      ...      ...   
+2025-04-27    15482.88               93.75          4057  16830.0  2309.37   
+2025-04-28    15637.63               95.60          3943  16855.0  2310.59   
+2025-04-29    15564.00               97.25          3911  16760.0  2305.52   
+2025-04-30    15342.50               97.50          3911  16600.0  2282.94   
+2025-05-01    15218.63               97.50          3881  16600.0  2282.94   
+
+            EUR_IDR       BTC_USD      FTSE100     HANGSENG    NIKKEI225  \
+Date                                                                       
+2015-05-01  14519.9    232.078995  6986.000000  28123.82031  19531.63086   
+2015-05-02  14519.9    234.929993  6986.000000  28123.82031  19531.63086   
+2015-05-03  14519.9    240.358002  6986.000000  28123.82031  19531.63086   
+2015-05-04  14467.5    239.018005  6986.000000  28123.82031  19531.63086   
+2015-05-05  14594.9    236.121002  6927.600098  27755.53906  19531.63086   
+...             ...           ...          ...          ...          ...   
+2025-04-27  19127.3  93754.843750  8415.299805  21980.74023  35705.73828   
+2025-04-28  19251.8  94978.750000  8417.299805  21971.96094  35839.98828   
+2025-04-29  19082.1  94284.789060  8463.500000  22008.10938  35839.98828   
+2025-04-30  18805.3  94207.312500  8494.900391  22119.41016  36045.37891   
+2025-05-01  18745.6  96492.335940  8496.799805  22119.41016  36452.30078   
+
+                 SNP500        DOW30  SSE_Composite         JKSE  
+Date                                                              
+2015-05-01  2108.290039  18024.06055    4480.463867  5140.937012  
+2015-05-02  2108.290039  18024.06055    4480.463867  5140.937012  
+2015-05-03  2108.290039  18024.06055    4480.463867  5140.937012  
+2015-05-04  2114.489990  18070.40039    4480.463867  5140.937012  
+2015-05-05  2089.459961  17928.19922    4298.706055  5160.107422  
+...                 ...          ...            ...          ...  
+2025-04-27  5525.209961  40113.50000    3295.060059  6678.915039  
+2025-04-28  5528.750000  40227.58984    3288.415039  6722.965820  
+2025-04-29  5560.830078  40527.62109    3286.655029  6749.075195  
+2025-04-30  5569.060059  40669.35938    3279.031006  6766.794922  
+2025-05-01  5604.140137  40752.96094    3279.031006  6766.794922  
+
+[3654 rows x 14 columns]
+--------------------------------------------------------------------------------
+Cell 4
+Cell type: code
+-- Code --
+plt.figure(figsize=(12, 7))
+plt.plot(df.index, df)
+plt.title(f"Dataset Plot")
+plt.xlabel("Date"); plt.ylabel("Price")
+plt.legend(labels=df.columns)
+plt.show()
+-- Outputs --
+[1] output_type: display_data
+<Figure size 1200x700 with 1 Axes>
+--------------------------------------------------------------------------------
+Cell 5
+Cell type: code
+-- Code --
+n = len(df)
+test_n = int(np.floor(TEST_SIZE * n))
+trainval_n = n - test_n
+val_n = int(np.floor(VAL_SIZE * trainval_n))
+train_n = trainval_n - val_n
+
+train_df = df.iloc[:train_n].copy()
+val_df   = df.iloc[train_n:train_n + val_n].copy()
+test_df  = df.iloc[train_n + val_n:].copy()
+--------------------------------------------------------------------------------
+Cell 6
+Cell type: code
+-- Code --
+feature_cols = df.columns.tolist() if INCLUDE_TARGET_AS_FEATURE else [c for c in df.columns if c != TARGET_COL]
+feature_cols
+-- Outputs --
+[1] output_type: execute_result
+['Nickel_Fut',
+ 'Coal_Fut_Newcastle',
+ 'Palm_Oil_Fut',
+ 'USD_IDR',
+ 'CNY_IDR',
+ 'EUR_IDR',
+ 'BTC_USD',
+ 'FTSE100',
+ 'HANGSENG',
+ 'NIKKEI225',
+ 'SNP500',
+ 'DOW30',
+ 'SSE_Composite',
+ 'JKSE']
+--------------------------------------------------------------------------------
+Cell 7
+Cell type: code
+-- Code --
+# scalers
+X_scaler = StandardScaler().fit(train_df[feature_cols])
+y_scaler = StandardScaler().fit(train_df[[TARGET_COL]])
+y_mean, y_scale = float(y_scaler.mean_[0]), float(y_scaler.scale_[0])
+
+def scale_block(block):
+    X = X_scaler.transform(block[feature_cols])
+    y = y_scaler.transform(block[[TARGET_COL]])
+    return pd.DataFrame(X, index=block.index, columns=feature_cols), pd.DataFrame(y, index=block.index, columns=[TARGET_COL])
+
+X_train_s, y_train_s = scale_block(train_df)
+X_val_s,   y_val_s   = scale_block(val_df)
+X_test_s,  y_test_s  = scale_block(test_df)
+
+def make_windows(X_df, y_df, lookback):
+    X_vals = X_df.values; y_vals = y_df.values.squeeze(); idx = X_df.index
+    X_list, y_list, idx_list = [], [], []
+    for i in range(lookback, len(X_df)):
+        X_list.append(X_vals[i - lookback:i, :])
+        y_list.append(y_vals[i]); idx_list.append(idx[i])
+    return (np.array(X_list, np.float32),
+            np.array(y_list, np.float32),
+            np.array(idx_list))
+
+X_train_w, y_train_w, idx_train = make_windows(X_train_s, y_train_s, BEST["lookback"])
+X_val_w,   y_val_w,   idx_val   = make_windows(X_val_s,   y_val_s,   BEST["lookback"])
+X_test_w,  y_test_w,  idx_test  = make_windows(X_test_s,  y_test_s,  BEST["lookback"])
+--------------------------------------------------------------------------------
+Cell 8
+Cell type: code
+-- Code --
+# ---------------------- LSTM Quantile model ----------------------
+def build_lstm_quantile(n_features:int, dropout_rate:float):
+    m = Sequential()
+    m.add(Input(shape=(BEST["lookback"], n_features)))
+    if BEST["num_layers"] == 2:
+        # m.add(LSTM(BEST["units1"], return_sequences=True)); m.add(Dropout(dropout_rate))
+        # m.add(LSTM(BEST["units2"]))
+        pass
+    else:
+        m.add(LSTM(BEST["units1"]))
+    m.add(Dropout(dropout_rate))            # regularization; no MC here
+    m.add(Dense(len(TAUS)))                 # outputs [q_lower, q_med, q_upper] (standardized)
+    return m
+
+def pinball_multi(taus):
+    taus = tf.constant(taus, dtype=tf.float32)
+    def loss(y_true, y_pred):
+        y_t = tf.expand_dims(y_true, axis=-1)     # (B,1)
+        e   = y_t - y_pred                        # (B,Q)
+        l   = tf.maximum(taus*e, (taus-1.0)*e)    # pinball elementwise
+        return tf.reduce_mean(tf.reduce_sum(l, axis=-1))
+    return loss
+
+def compile_member():
+    m = build_lstm_quantile(n_features=len(feature_cols), dropout_rate=BEST["dropout"])
+    m.compile(optimizer=optimizers.Adam(learning_rate=BEST["lr"]), loss=pinball_multi(TAUS))
+    return m
+
+def bootstrap_idx(n, seed):
+    rng = np.random.default_rng(seed)
+    return rng.integers(0, n, size=n)
+
+def train_member(seed):
+    print(f"\nTraining member with seed {seed} ...")
+    tf.keras.utils.set_random_seed(seed)
+    member = compile_member()
+    if BOOTSTRAP:
+        idx_bs = bootstrap_idx(len(X_train_w), seed+777)
+        Xb, yb = X_train_w[idx_bs], y_train_w[idx_bs]
+    else:
+        Xb, yb = X_train_w, y_train_w
+    cbs = [
+        EarlyStopping(monitor="val_loss", patience=BEST["patience"], restore_best_weights=True),
+        ModelCheckpoint(f"Model Checkpoints/lstm_cqr_member_{seed}.keras", monitor="val_loss", save_best_only=True)
+    ]
+    member.fit(Xb, yb,
+               validation_data=(X_val_w, y_val_w),
+               epochs=BEST["epochs"],
+               batch_size=BEST["batch_size"],
+               verbose=1, callbacks=cbs)
+    return member
+
+print(f"\nTraining LSTM+CQR ensemble with M={M_ENSEMBLE} ...")
+t0_train = time.time()
+members = [train_member(SEED_BASE + 137*i) for i in range(M_ENSEMBLE)]
+t1_train = time.time()
+print(f"\nTraining completed in {round(t1_train - t0_train, 4)} seconds.")
+-- Outputs --
+[1] output_type: stream
+
+Training LSTM+CQR ensemble with M=5 ...
+Epoch 1/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m3s[0m 21ms/step - loss: 0.2711 - val_loss: 0.1915
+Epoch 2/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 19ms/step - loss: 0.0898 - val_loss: 0.0958
+Epoch 3/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0752 - val_loss: 0.1367
+Epoch 4/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0642 - val_loss: 0.0678
+Epoch 5/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 18ms/step - loss: 0.0590 - val_loss: 0.0720
+Epoch 6/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 19ms/step - loss: 0.0592 - val_loss: 0.0600
+Epoch 7/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0542 - val_loss: 0.0746
+Epoch 8/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 17ms/step - loss: 0.0590 - val_loss: 0.0441
+Epoch 9/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0566 - val_loss: 0.0668
+Epoch 10/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 17ms/step - loss: 0.0573 - val_loss: 0.0475
+Epoch 11/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 18ms/step - loss: 0.0539 - val_loss: 0.0600
+Epoch 12/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 17ms/step - loss: 0.0533 - val_loss: 0.0657
+Epoch 13/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0511 - val_loss: 0.0781
+Epoch 14/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0528 - val_loss: 0.0431
+Epoch 15/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0505 - val_loss: 0.0431
+Epoch 16/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 18ms/step - loss: 0.0500 - val_loss: 0.0393
+Epoch 17/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 19ms/step - loss: 0.0511 - val_loss: 0.0851
+Epoch 18/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0515 - val_loss: 0.0450
+Epoch 19/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0516 - val_loss: 0.0376
+Epoch 20/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0510 - val_loss: 0.0496
+Epoch 21/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 17ms/step - loss: 0.0498 - val_loss: 0.0731
+Epoch 22/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0463 - val_loss: 0.0706
+Epoch 23/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 18ms/step - loss: 0.0491 - val_loss: 0.0478
+Epoch 24/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 17ms/step - loss: 0.0504 - val_loss: 0.0440
+Epoch 25/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 17ms/step - loss: 0.0470 - val_loss: 0.0619
+Epoch 26/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0475 - val_loss: 0.0575
+Epoch 27/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 17ms/step - loss: 0.0459 - val_loss: 0.0401
+Epoch 28/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0485 - val_loss: 0.0580
+Epoch 1/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m3s[0m 20ms/step - loss: 0.2717 - val_loss: 0.2400
+Epoch 2/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 19ms/step - loss: 0.0891 - val_loss: 0.1576
+Epoch 3/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0758 - val_loss: 0.0902
+Epoch 4/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 17ms/step - loss: 0.0670 - val_loss: 0.1584
+Epoch 5/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 17ms/step - loss: 0.0668 - val_loss: 0.0921
+Epoch 6/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 18ms/step - loss: 0.0616 - val_loss: 0.0585
+Epoch 7/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 19ms/step - loss: 0.0592 - val_loss: 0.0532
+Epoch 8/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 17ms/step - loss: 0.0592 - val_loss: 0.0585
+Epoch 9/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0602 - val_loss: 0.1239
+Epoch 10/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0538 - val_loss: 0.0471
+Epoch 11/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0553 - val_loss: 0.0421
+Epoch 12/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0517 - val_loss: 0.0420
+Epoch 13/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 19ms/step - loss: 0.0549 - val_loss: 0.0487
+Epoch 14/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 17ms/step - loss: 0.0534 - val_loss: 0.0789
+Epoch 15/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0510 - val_loss: 0.0508
+Epoch 16/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 21ms/step - loss: 0.0489 - val_loss: 0.0374
+Epoch 17/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 17ms/step - loss: 0.0506 - val_loss: 0.0859
+Epoch 18/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 19ms/step - loss: 0.0461 - val_loss: 0.0443
+Epoch 19/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 18ms/step - loss: 0.0476 - val_loss: 0.0811
+Epoch 20/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0456 - val_loss: 0.0426
+Epoch 21/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 17ms/step - loss: 0.0481 - val_loss: 0.1111
+Epoch 22/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 17ms/step - loss: 0.0492 - val_loss: 0.0430
+Epoch 23/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 17ms/step - loss: 0.0515 - val_loss: 0.0424
+Epoch 24/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 19ms/step - loss: 0.0460 - val_loss: 0.0468
+Epoch 25/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 17ms/step - loss: 0.0450 - val_loss: 0.0947
+Epoch 1/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m3s[0m 20ms/step - loss: 0.3179 - val_loss: 0.1145
+Epoch 2/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 18ms/step - loss: 0.0879 - val_loss: 0.0812
+Epoch 3/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0731 - val_loss: 0.0793
+Epoch 4/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 18ms/step - loss: 0.0637 - val_loss: 0.1365
+Epoch 5/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m1s[0m 18ms/step - loss: 0.0684 - val_loss: 0.0675
+Epoch 6/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 19ms/step - loss: 0.0611 - val_loss: 0.0664
+Epoch 7/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 19ms/step - loss: 0.0579 - val_loss: 0.0595
+Epoch 8/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 19ms/step - loss: 0.0567 - val_loss: 0.0968
+Epoch 9/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 20ms/step - loss: 0.0601 - val_loss: 0.0545
+Epoch 10/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 19ms/step - loss: 0.0568 - val_loss: 0.0436
+Epoch 11/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 18ms/step - loss: 0.0557 - val_loss: 0.0551
+Epoch 12/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 19ms/step - loss: 0.0536 - val_loss: 0.0829
+Epoch 13/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 20ms/step - loss: 0.0488 - val_loss: 0.0726
+Epoch 14/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 20ms/step - loss: 0.0509 - val_loss: 0.0467
+Epoch 15/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 20ms/step - loss: 0.0525 - val_loss: 0.0655
+Epoch 16/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 19ms/step - loss: 0.0494 - val_loss: 0.0438
+Epoch 17/60
+[1m82/82[0m [32m━━━━━━━━━━━━━━━━━━━━[0m[37m[0m [1m2s[0m 21ms/step - loss: 0.0471 - val_loss: 0.1158
+Epoch 18/60
+[1m56/82[0m [32m━━━━━━━━━━━━━[0m[37m━━━━━━━[0m [1m0s[0m 18ms/step - loss: 0.0515
+--------------------------------------------------------------------------------
+Cell 9
+Cell type: code
+-- Code --
+# ---------------------- Predict quantiles per member & inverse-scale ----------------------
+def predict_quantiles_member(m, X, idx):
+    qz = m.predict(X, verbose=1)           # (N,3) in standardized space
+    qy = qz * y_scale + y_mean             # linear inverse transform preserves quantiles
+    qy = np.sort(qy, axis=1)               # enforce monotonicity
+    return (pd.Series(qy[:,0], index=idx),
+            pd.Series(qy[:,1], index=idx),
+            pd.Series(qy[:,2], index=idx))
+
+def predict_all(members, X, idx):
+    Ls, Ms, Us = [], [], []
+    for m in members:
+        qL, qM, qU = predict_quantiles_member(m, X, idx)
+        Ls.append(qL.values); Ms.append(qM.values); Us.append(qU.values)
+    Ls = np.stack(Ls, axis=1)  # (N,M)
+    Ms = np.stack(Ms, axis=1)
+    Us = np.stack(Us, axis=1)
+    L_bar = pd.Series(Ls.mean(axis=1), index=idx, name="qL_bar")
+    M_bar = pd.Series(Ms.mean(axis=1), index=idx, name="qM_bar")
+    U_bar = pd.Series(Us.mean(axis=1), index=idx, name="qU_bar")
+    # Epistemic variance ≈ variance across members of the median prediction
+    var_epi = pd.Series(Ms.var(axis=1, ddof=1) if Ms.shape[1]>1 else np.zeros(Ms.shape[0]),
+                        index=idx, name="var_epistemic")
+    # Aleatoric variance proxy from inter-quantile width (Gaussian approx)
+    IQR = U_bar.values - L_bar.values
+    sigma_alea = IQR / 3.92
+    var_alea = pd.Series(np.maximum(sigma_alea, 0)**2, index=idx, name="var_aleatoric")
+    return L_bar, M_bar, U_bar, var_epi, var_alea
+
+t0_test = time.time()
+L_tr_bar, M_tr_bar, U_tr_bar, var_epi_tr, var_alea_tr = predict_all(members, X_train_w, idx_train)
+L_v_bar,  M_v_bar,  U_v_bar,  var_epi_v,  var_alea_v  = predict_all(members, X_val_w,   idx_val)
+L_te_bar, M_te_bar, U_te_bar, var_epi_te, var_alea_te = predict_all(members, X_test_w,  idx_test)
+t1_test = time.time()
+print(f"\nTesting completed in {round(t1_test - t0_test, 4)} seconds.")
+
+actual = df[TARGET_COL]
+actual_train = actual.loc[idx_train]
+actual_val   = actual.loc[idx_val]
+actual_test  = actual.loc[idx_test]
+--------------------------------------------------------------------------------
+Cell 10
+Cell type: code
+-- Code --
+# ---------------------- Split Conformal Calibration (validation) ----------------------
+E_val = np.maximum(L_v_bar.values - actual_val.values, actual_val.values - U_v_bar.values)
+E_val = np.maximum(E_val, 0.0)
+q_hat = np.quantile(E_val, 1 - ALPHA, method="higher") if hasattr(np, "quantile") \
+        else np.percentile(E_val, (1-ALPHA)*100, interpolation="higher")
+
+# Final conformalized intervals
+L_train = L_tr_bar - q_hat;   U_train = U_tr_bar + q_hat
+L_val   = L_v_bar  - q_hat;   U_val   = U_v_bar  + q_hat
+L_test  = L_te_bar - q_hat;   U_test  = U_te_bar + q_hat
+
+# Point forecast = ensemble median
+mean_train = M_tr_bar.rename("point_pred")
+mean_val   = M_v_bar.rename("point_pred")
+mean_test  = M_te_bar.rename("point_pred")
+--------------------------------------------------------------------------------
+Cell 11
+Cell type: code
+-- Code --
+# ---------------------- Metrics ----------------------
+def base_metrics(y_true, y_pred):
+    mse  = mean_squared_error(y_true, y_pred)
+    mae  = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mape = mean_absolute_percentage_error(y_true, y_pred)
+    r2   = r2_score(y_true, y_pred)
+    return dict(MSE=mse, MAE=mae, RMSE=rmse, MAPE=mape, R2=r2)
+
+def uq_metrics(y_true, L, U, alpha=ALPHA):
+    y = np.asarray(y_true); L = np.asarray(L); U = np.asarray(U)
+    cover = (y >= L) & (y <= U)
+    picp = cover.mean()
+    mpiw = np.mean(U - L)
+    penalty = np.where(y < L, (2/alpha)*(L - y),
+              np.where(y > U, (2/alpha)*(y - U), 0.0))
+    winkler = np.mean((U - L) + penalty)
+    return dict(PICP=picp, MPIW=mpiw, Winkler=winkler)
+
+print("\n=== Point Forecast Metrics (median) — LSTM + CQR Ensemble ===")
+print("Train:", base_metrics(actual_train.values, mean_train.values))
+print("Val:  ", base_metrics(actual_val.values,   mean_val.values))
+print("Test: ", base_metrics(actual_test.values,  mean_test.values))
+
+print(f"\n=== UQ Metrics ({int((1-ALPHA)*100)}% PI) — CQR (conformalized) ===")
+print("Train:", uq_metrics(actual_train.values, L_train.values, U_train.values, ALPHA))
+print("Val:  ", uq_metrics(actual_val.values,   L_val.values,   U_val.values,   ALPHA))
+print("Test: ", uq_metrics(actual_test.values,  L_test.values,  U_test.values,  ALPHA))
+-- Outputs --
+[1] output_type: stream
+
+=== Point Forecast Metrics (median) — LSTM + CQR Ensemble ===
+Train: {'MSE': 1871.162086507458, 'MAE': 29.062021132072445, 'RMSE': 43.25693108055006, 'MAPE': 0.005311636711971622, 'R2': 0.9953296286703935}
+Val:   {'MSE': 134392.41935583035, 'MAE': 336.220423036341, 'RMSE': 366.59571649956627, 'MAPE': 0.04836633211028636, 'R2': -2.0672832318139416}
+Test:  {'MSE': 148484.25250608064, 'MAE': 360.8343429764436, 'RMSE': 385.33654447259556, 'MAPE': 0.05037079335777753, 'R2': -0.30743069984534555}
+
+=== UQ Metrics (95% PI) — CQR (conformalized) ===
+Train: {'PICP': 1.0, 'MPIW': 1033.8008, 'Winkler': 1033.80086486267}
+Val:   {'PICP': 0.949740034662045, 'MPIW': 1141.0416, 'Winkler': 1213.9961234616012}
+Test:  {'PICP': 0.8824343015214384, 'MPIW': 1066.7303, 'Winkler': 1394.9649119590676}
+--------------------------------------------------------------------------------
+Cell 12
+Cell type: code
+-- Code --
+# ---------------------- Uncertainty decomposition (proxies) ----------------------
+var_total_te = pd.Series(var_epi_te.values + var_alea_te.values, index=idx_test, name="var_total")
+conformal_width = 2.0 * q_hat
+print(f"\nConformal inflation width (constant added to PI): {conformal_width:.4f}")
+-- Outputs --
+[1] output_type: stream
+
+Conformal inflation width (constant added to PI): 808.4063
+--------------------------------------------------------------------------------
+Cell 13
+Cell type: code
+-- Code --
+# ---------------------- Visualizations ----------------------
+def classify_inside_outside(y_true_s, L_s, U_s):
+    y = np.asarray(y_true_s); L = np.asarray(L_s); U = np.asarray(U_s)
+    inside = (y >= L) & (y <= U)
+    return inside, ~inside
+
+# 1) Full series view
+plt.figure(figsize=(12,5))
+plt.plot(actual.index, actual.values, label="Actual", linewidth=1)
+plt.plot(mean_train.index, mean_train.values, label="Pred (Train, median ensemble)", linewidth=1)
+plt.plot(mean_val.index,   mean_val.values,   label="Pred (Val, median ensemble)", linewidth=1)
+plt.plot(mean_test.index,  mean_test.values,  label="Pred (Test, median ensemble)", linewidth=1.5)
+plt.fill_between(L_test.index, L_test.values, U_test.values, alpha=0.25,
+                 label=f"{int((1-ALPHA)*100)}% CQR PI (Test)")
+plt.title("All Actual vs Predicted — LSTM + CQR (Ensemble)")
+plt.xlabel("Date"); plt.ylabel(TARGET_COL); plt.legend(); plt.tight_layout(); plt.show()
+
+# 2) Test horizon with inside/outside markers
+inside_mask, outside_mask = classify_inside_outside(actual_test.values, L_test.values, U_test.values)
+plt.figure(figsize=(12,5))
+plt.plot(actual_test.index, actual_test.values, label="Actual (Test)", linewidth=1.5)
+plt.plot(mean_test.index,   mean_test.values,   label="Pred (Test, median ensemble)", linewidth=1.5)
+plt.fill_between(L_test.index, L_test.values, U_test.values, alpha=0.30, label=f"{int((1-ALPHA)*100)}% CQR PI")
+plt.scatter(actual_test.index[inside_mask],  actual_test.values[inside_mask],  s=15, label="Inside PI", zorder=3, color="limegreen")
+plt.scatter(actual_test.index[outside_mask], actual_test.values[outside_mask], s=25, marker="x", label="Outside PI", zorder=3, color="red")
+plt.title("Test: Median with Conformal PI (+ inside/outside)")
+plt.xlabel("Date"); plt.ylabel(TARGET_COL); plt.legend(); plt.tight_layout(); plt.show()
+
+# 3) Residuals (median-as-point)
+residuals_test = pd.Series(actual_test.values - mean_test.values, index=actual_test.index, name="Residuals")
+plt.figure(figsize=(12,4))
+plt.plot(residuals_test.index, residuals_test.values, linewidth=1)
+plt.axhline(0, ls="--", lw=1); plt.title("Residuals Over Time (Test) — LSTM + CQR (median)")
+plt.xlabel("Date"); plt.ylabel("Actual - Pred"); plt.tight_layout(); plt.show()
+
+# 4) Uncertainty decomposition over time
+plt.figure(figsize=(12,5))
+plt.plot(var_epi_te.index,  var_epi_te.values,  label="Epistemic Var (ensemble median spread)", linewidth=1)
+plt.plot(var_alea_te.index, var_alea_te.values, label="Aleatoric Var (IQR/3.92)^2", linewidth=1)
+plt.plot(var_total_te.index, var_total_te.values, label="Total (proxy) = epi + alea", linewidth=1.2)
+plt.title("Uncertainty Decomposition Over Time — LSTM + CQR (Ensemble)")
+plt.xlabel("Date"); plt.ylabel("Variance (proxy)"); plt.legend(); plt.tight_layout(); plt.show()
+
+# 5) Coverage heatmap (per-window)
+from matplotlib.colors import ListedColormap, BoundaryNorm
+y_true = actual_test.values; L_arr = L_test.values; U_arr = U_test.values
+below_mask = (y_true < L_arr); above_mask = (y_true > U_arr); inside_mask = (y_true >= L_arr) & (y_true <= U_arr)
+status = np.zeros_like(y_true, dtype=int); status[below_mask] = -1; status[above_mask] = 1
+starts = np.arange(0, len(status)-HEAT_WIN+1, HEAT_STRIDE)
+if len(starts) == 0: starts = np.array([0]); HEAT_WIN = len(status)
+mat = []; x_tick_labels = []
+for s in starts:
+    e = min(s + HEAT_WIN, len(status)); row = status[s:e]
+    if e - s < HEAT_WIN: row = np.pad(row, (0, HEAT_WIN - (e - s)), constant_values=np.nan)
+    mat.append(row); x_tick_labels.append(actual_test.index[s].strftime('%Y-%m-%d'))
+mat = np.vstack(mat)
+cmap = ListedColormap(["#d62728", "#2ca02c", "#ff7f0e", "#bdbdbd"])
+bounds = [-1.5, -0.5, 0.5, 1.5, 2.5]; norm = BoundaryNorm(bounds, cmap.N)
+plt.figure(figsize=(12,6))
+plt.imshow(mat, aspect="auto", interpolation="nearest", cmap=cmap, norm=norm)
+plt.title(f"Coverage Heatmap (Test) — window={HEAT_WIN}, stride={HEAT_STRIDE}\n-1: Below | 0: Inside | +1: Above")
+plt.xlabel("Position inside window"); plt.ylabel("Window start time")
+yticks = np.arange(0, len(starts), max(1, len(starts)//10))
+plt.yticks(yticks, [x_tick_labels[i] for i in yticks])
+import matplotlib.patches as mpatches
+legend_patches = [
+    mpatches.Patch(color="#2ca02c", label="Inside PI"),
+    mpatches.Patch(color="#d62728", label="Below lower"),
+    mpatches.Patch(color="#ff7f0e", label="Above upper"),
+    mpatches.Patch(color="#bdbdbd", label="Padding")
+]
+plt.legend(handles=legend_patches, loc="upper right", frameon=True)
+plt.tight_layout(); plt.show()
+
+# 6) Rolling PICP & Rolling MPIW
+inside_series = pd.Series(((y_true >= L_arr) & (y_true <= U_arr)).astype(int), index=actual_test.index, name="inside")
+rolling_picp = inside_series.rolling(window=ROLL_LEN, center=True, min_periods=max(3, ROLL_LEN//3)).mean()
+plt.figure(figsize=(12,4))
+plt.plot(rolling_picp.index, rolling_picp.values, linewidth=1.8, label=f"Rolling PICP (window={ROLL_LEN})")
+plt.axhline(1 - ALPHA, ls="--", lw=1, label=f"Target = {1-ALPHA:.2f}")
+plt.ylim(0, 1.05)
+plt.title("Rolling PICP on Test (Calibration over Time) — LSTM+CQR")
+plt.xlabel("Date"); plt.ylabel("Coverage"); plt.legend(); plt.tight_layout(); plt.show()
+
+width_series   = pd.Series((U_arr - L_arr), index=actual_test.index, name="PI_width")
+rolling_mpiw   = width_series.rolling(window=ROLL_LEN, center=True, min_periods=max(3, ROLL_LEN//3)).mean()
+overall_mpiw_t = width_series.mean()
+plt.figure(figsize=(12,4))
+plt.plot(rolling_mpiw.index, rolling_mpiw.values, linewidth=1.8, label=f"Rolling MPIW (window={ROLL_LEN})")
+plt.axhline(overall_mpiw_t, ls="--", lw=1, label=f"Overall MPIW (Test) = {overall_mpiw_t:.2f}")
+plt.title("Rolling MPIW on Test (Sharpness over Time) — LSTM+CQR")
+plt.xlabel("Date"); plt.ylabel("Interval Width"); plt.legend(); plt.tight_layout(); plt.show()
+
+# (Optional) If you want a normalized comparison with Rolling PICP in a separate plot:
+norm_mpiw = (rolling_mpiw - np.nanmin(rolling_mpiw)) / (np.nanmax(rolling_mpiw) - np.nanmin(rolling_mpiw) + 1e-12)
+plt.figure(figsize=(12, 4))
+plt.plot(rolling_picp.index, rolling_picp.values, linewidth=1.8, label="Rolling PICP (0–1)")
+plt.plot(norm_mpiw.index, norm_mpiw.values, linewidth=1.5, label="Rolling MPIW (normalized 0–1)")
+plt.axhline(1 - ALPHA, ls="--", lw=1, label=f"Target coverage = {1-ALPHA:.2f}")
+plt.title("Rolling PICP vs Normalized Rolling MPIW (Test)")
+plt.xlabel("Date"); plt.ylabel("Scaled value")
+plt.legend(); plt.tight_layout(); plt.show()
+-- Outputs --
+[1] output_type: display_data
+<Figure size 1200x500 with 1 Axes>
+[2] output_type: display_data
+<Figure size 1200x500 with 1 Axes>
+[3] output_type: display_data
+<Figure size 1200x400 with 1 Axes>
+[4] output_type: display_data
+<Figure size 1200x500 with 1 Axes>
+[5] output_type: display_data
+<Figure size 1200x600 with 1 Axes>
+[6] output_type: display_data
+<Figure size 1200x400 with 1 Axes>
+[7] output_type: display_data
+<Figure size 1200x400 with 1 Axes>
+[8] output_type: display_data
+<Figure size 1200x400 with 1 Axes>
+--------------------------------------------------------------------------------
+Cell 14
+Cell type: code
+-- Code --
+# ---------------------- Compact summary table ----------------------
+def table_metrics():
+    rows = []
+    for tag, y_true_s, y_pred_s, L_s, U_s in [
+        ("Train", actual_train, mean_train, L_train, U_train),
+        ("Val",   actual_val,   mean_val,   L_val,   U_val),
+        ("Test",  actual_test,  mean_test,  L_test,  U_test),
+    ]:
+        b = base_metrics(y_true_s.values, y_pred_s.values)
+        u = uq_metrics(y_true_s.values, L_s.values, U_s.values, ALPHA)
+        rows.append({"Split": tag, **{k: round(v,4) for k,v in b.items()},
+                     "PICP": round(u["PICP"],4), "MPIW": round(u["MPIW"],4), "Winkler": round(u["Winkler"],4)})
+    return pd.DataFrame(rows)
+
+summary_df = table_metrics()
+print("\n=== Summary (Point + UQ) — LSTM + Conformal Quantile Regression (Ensemble) ===")
+print(summary_df.to_string(index=False))
+-- Outputs --
+[1] output_type: stream
+
+=== Summary (Point + UQ) — LSTM + Conformal Quantile Regression (Ensemble) ===
+Split         MSE      MAE     RMSE   MAPE      R2   PICP        MPIW   Winkler
+Train   1871.1621  29.0620  43.2569 0.0053  0.9953 1.0000 1033.800781 1033.8009
+  Val 134392.4194 336.2204 366.5957 0.0484 -2.0673 0.9497 1141.041626 1213.9961
+ Test 148484.2525 360.8343 385.3365 0.0504 -0.3074 0.8824 1066.730347 1394.9649
+--------------------------------------------------------------------------------
+Cell 15
+Cell type: code
+-- Code --
+# === CONFIGURATION ===
+results_dir = os.path.join("..", "Results")
+predicted_path = os.path.join(results_dir, "ALL_UQ_PREDICTED.csv")
+metrics_path   = os.path.join(results_dir, "ALL_UQ_METRICS.csv")
+
+model = "lstm_cqr"
+model_name = f"{model}_{RANDOM_SEED}"
+
+print("Model Name for Documentation:", model_name)
+
+os.makedirs(results_dir, exist_ok=True)
+
+# ============================================================
+# 1️⃣ PREPARE AND ALIGN TESTING DATAFRAME
+# ============================================================
+
+test_dates     = actual_test.index.to_series().reset_index(drop=True)
+actual_values  = actual_test.values
+
+# Create if not exist
+if not os.path.exists(predicted_path):
+    print("Creating ALL_UQ_PREDICTED.csv ...")
+    base_df = pd.DataFrame({"date": test_dates, "actual": actual_values})
+    base_df.to_csv(predicted_path, index=False)
+
+# Load existing
+all_pred_df = pd.read_csv(predicted_path)
+all_pred_df["date"] = pd.to_datetime(all_pred_df["date"])
+
+# Ensure correct timeline
+base_df = pd.DataFrame({"date": test_dates, "actual": actual_values})
+all_pred_df = pd.merge(base_df, all_pred_df, on=["date", "actual"], how="outer")
+
+# Align predictions
+pred_series = pd.Series(mean_test.values, index=actual_test.index, name=model_name)
+pred_series = pred_series.reindex(all_pred_df["date"])
+
+L_series = pd.Series(L_test.values, index=actual_test.index, name=f"{model_name}_L")
+U_series = pd.Series(U_test.values, index=actual_test.index, name=f"{model_name}_U")
+L_series = L_series.reindex(all_pred_df["date"])
+U_series = U_series.reindex(all_pred_df["date"])
+
+# Write columns
+all_pred_df[model_name]        = pred_series.values
+all_pred_df[f"{model_name}_L"] = L_series.values
+all_pred_df[f"{model_name}_U"] = U_series.values
+
+all_pred_df = all_pred_df.sort_values("date").reset_index(drop=True)
+all_pred_df.to_csv(predicted_path, index=False)
+
+print(f"✅ Predictions saved to {predicted_path}")
+
+# ============================================================
+# 2️⃣ RECORD METRICS
+# ============================================================
+
+metrics_columns = [
+    "timestamp", "model_name", "seed",
+    "mse", "mae", "rmse", "mape", "r2_score",
+    "picp", "mpiw", "winkler_score",
+    "training_time_s", "testing_time_s",
+    "hpo_trial_s", "hpo_time_s"
+]
+
+# Create file if missing
+if not os.path.exists(metrics_path):
+    print("Creating ALL_UQ_METRICS.csv ...")
+    pd.DataFrame(columns=metrics_columns).to_csv(metrics_path, index=False)
+
+timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# Compute metrics
+mse, mae, rmse, mape, r2 = base_metrics(actual_test.values, mean_test.values).values()
+picp, mpiw, winkler = uq_metrics(actual_test.values, L_test.values, U_test.values, ALPHA).values()
+
+metrics_row = {
+    "timestamp": timestamp,
+    "model_name": model_name,
+    "seed": RANDOM_SEED,
+    "mse": mse,
+    "mae": mae,
+    "rmse": rmse,
+    "mape": mape,
+    "r2_score": r2,
+    "picp": picp,
+    "mpiw": mpiw,
+    "winkler_score": winkler,
+    "training_time_s": round(t1_train - t0_train, 4),
+    "testing_time_s": round(t1_test - t0_test, 4),
+    "hpo_trial_s": 0,
+    "hpo_time_s": 0,
+}
+
+# Append
+all_metrics_df = pd.read_csv(metrics_path)
+all_metrics_df = pd.concat([all_metrics_df, pd.DataFrame([metrics_row])], ignore_index=True)
+all_metrics_df.to_csv(metrics_path, index=False)
+
+print(f"✅ Metrics appended to {metrics_path}")
+print("\n📄 Documentation of predictions and metrics completed successfully.")
+--------------------------------------------------------------------------------
