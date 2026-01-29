@@ -1,0 +1,15 @@
+Variable,VIF,Multicollinearity Level
+DOW30,2607.8066246525404,High Multicollinearity
+CNY_IDR,2581.8726221498614,High Multicollinearity
+SNP500,2175.4734334260897,High Multicollinearity
+EUR_IDR,2171.6569413411353,High Multicollinearity
+USD_IDR,1886.8125285948133,High Multicollinearity
+JKSE,524.8968141005715,High Multicollinearity
+FTSE100,487.36985417299815,High Multicollinearity
+NIKKEI225,432.86540462301963,High Multicollinearity
+HANGSENG,217.90114615239096,High Multicollinearity
+SSE_Composite,213.59514232253366,High Multicollinearity
+Palm_Oil_Fut,58.87118728151792,High Multicollinearity
+Nickel_Fut,36.110387407911084,High Multicollinearity
+BTC_USD,24.520607740567332,High Multicollinearity
+Coal_Fut_Newcastle,14.19268332015124,High Multicollinearity

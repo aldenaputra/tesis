@@ -1,0 +1,15 @@
+Variable,Number of Outliers,Percentage of Outliers (%),Distribution Type
+Nickel_Fut,99,2.71,Non-Normal
+Coal_Fut_Newcastle,341,9.33,Non-Normal
+Palm_Oil_Fut,98,2.68,Non-Normal
+USD_IDR,0,0.0,Non-Normal
+CNY_IDR,0,0.0,Non-Normal
+EUR_IDR,1,0.03,Non-Normal
+BTC_USD,118,3.23,Non-Normal
+FTSE100,91,2.49,Non-Normal
+HANGSENG,0,0.0,Non-Normal
+NIKKEI225,2,0.05,Non-Normal
+SNP500,0,0.0,Non-Normal
+DOW30,0,0.0,Non-Normal
+SSE_Composite,82,2.24,Non-Normal
+JKSE,0,0.0,Non-Normal
