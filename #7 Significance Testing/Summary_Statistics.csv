@@ -1,0 +1,23 @@
+Metric,Value
+Total Features Analyzed,13
+Dataset Size,3654 observations
+Pearson Mean |r|,0.5766
+Pearson Max |r|,0.8369
+Pearson Min |r|,0.0818
+Pearson Significant (p<0.05),13 / 13
+Spearman Mean |ρ|,0.6211
+Spearman Max |ρ|,0.8363
+Spearman Min |ρ|,0.0014
+Spearman Significant (p<0.05),12 / 13
+dCor Mean,0.6339
+dCor Max,0.8175
+dCor Min,0.1834
+MI Mean Score,1.8007
+MI Max Score,2.2398
+MI Min Score,1.2630
+Granger Causality (p<0.05),9 / 13
+Granger Best p-value,0.000029
+Granger Worst p-value,0.486583
+Transfer Entropy Mean,0.034156
+Transfer Entropy Max,0.051935
+Transfer Entropy Min,0.019287
